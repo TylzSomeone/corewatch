@@ -1,6 +1,6 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
 -- Run corewatch to open the dashboard.
-local COREWATCH_VERSION = "1.16.2"
+local COREWATCH_VERSION = "1.16.3"
 
 local button = {}
 local filleds = {}

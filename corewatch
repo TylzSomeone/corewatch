@@ -1,6 +1,6 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
 -- Run corewatch to open the dashboard.
-local COREWATCH_VERSION = "1.16.1"
+local COREWATCH_VERSION = "1.16.2"
 
 local button = {}
 local filleds = {}
@@ -468,7 +468,10 @@ local function renderControls(mon, reactorActive)
    for name, data in pairs(button) do
       local color = data["color"]
       local accent
-      if name == "ON" or name == "OFF" then
+      if name == "INFO" then
+         data.title = downloadedUpdate and "UPDATE" or "INFO"
+         if downloadedUpdate then color = colors.green end
+      elseif name == "ON" or name == "OFF" then
          color = colors.gray
          local selectedState = reactorActive
          if controlMode == "STANDBY" then selectedState = standbyArmed end
@@ -1193,7 +1196,15 @@ function buildDashboard()
 	frame(numbersSize, "FUEL", margin)
 
 	local infoRight = math.floor(leftEdge) - 2
-	setButton("INFO", "INFO", showInfo, infoRight - 9, infosSize.inY - 1, infoRight, infosSize.inY + 1, nil, nil, colors.blue)
+	setButton("INFO", "INFO", function()
+		if downloadedUpdate then
+			showingInfo = true
+			infoPage = 1
+			showUpdates()
+		else
+			showInfo()
+		end
+	end, infoRight - 9, infosSize.inY - 1, infoRight, infosSize.inY + 1, nil, nil, colors.blue)
 
 	local x, y = controlsSize.inX, controlsSize.inY
 	local right = x + controlsSize.width

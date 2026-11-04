@@ -1,0 +1,1555 @@
+-- Corewatch | reactor control and telemetry for CC: Tweaked.
+-- Run corewatch to open the dashboard.
+local COREWATCH_VERSION = "1.16.1"
+
+local button = {}
+local filleds = {}
+local boxes = {}
+local lines = {}
+local texts = {}
+
+local showingInfo = false
+local infoPage = 1
+local showingStats = false
+local statsByMode = false
+local confirmSessionReset = false
+local session = {energy = 0, fuel = 0, seconds = 0, modes = {}}
+local showingModes = false
+local targetEntry
+local entryField
+local targetKeys = {}
+local controlMode = "AUTO"
+local bootMode = "AUTO"
+local choosingBootMode = false
+local standbyArmed = false
+local targetOutput = 500
+local modeOptions = {"AUTO", "MANUAL", "TARGET RF/t", "STANDBY", "LOAD MATCH"}
+
+local infosSize = {}
+local controlsSize = {}
+local numbersSize = {}
+
+
+local bufferPercent = 0
+local netBufferRate
+local estimatedExport
+local rfTotalMax = 10000000
+local minPowerRod = 0
+local maxPowerRod = 100
+
+local SETTINGS_FILE = "corewatch-settings.txt"
+
+local reactors = {}
+local monitors = {}
+
+local UPDATE_URL = "https://github.com/TylzSomeone/corewatch/releases/latest/download/corewatch"
+local programPath = shell.getRunningProgram()
+local checkAtBoot = false
+local showingUpdates = false
+local updatePending = false
+local downloadedUpdate
+local updateStatus = "Tap CHECK to look for a release."
+local updateInstalled = false
+
+local function newerVersion(candidate, installed)
+	local a, b, c = candidate:match("^(%d+)%.(%d+)%.(%d+)$")
+	local x, y, z = installed:match("^(%d+)%.(%d+)%.(%d+)$")
+	if not a or not x then return false end
+	a, b, c, x, y, z = tonumber(a), tonumber(b), tonumber(c), tonumber(x), tonumber(y), tonumber(z)
+	if a ~= x then return a > x end
+	if b ~= y then return b > y end
+	return c > z
+end
+
+local function checkForUpdate()
+	if updatePending or updateInstalled then return end
+	downloadedUpdate = nil
+	if not http or not http.request then
+		updateStatus = "HTTP is disabled on this server."
+		return
+	end
+	local ok, queued = pcall(http.request, {
+		url = UPDATE_URL, headers = {["Cache-Control"] = "no-cache"},
+	})
+	updatePending = ok and queued == true
+	updateStatus = updatePending and "Checking GitHub..." or "Could not start the GitHub request."
+end
+
+local function finishUpdateCheck(response)
+	updatePending = false
+	local ok, source = pcall(response.readAll)
+	response.close()
+	local version = ok and type(source) == "string"
+		and source:match('local COREWATCH_VERSION = "(%d+%.%d+%.%d+)"')
+	if not version or not source:match("^%-%- Corewatch |") or not load(source, "@corewatch-update", "t") then
+		updateStatus = "The download was not a valid Corewatch program."
+	elseif newerVersion(version, COREWATCH_VERSION) then
+		downloadedUpdate = source
+		updateStatus = "UPDATE AVAILABLE: v" .. version
+	elseif version == COREWATCH_VERSION then
+		updateStatus = "You are on the published version."
+	else
+		updateStatus = "This copy is newer than the published version."
+	end
+end
+
+local function installUpdate()
+	if not downloadedUpdate or updateInstalled then return end
+	local staged, backup = programPath .. ".download", programPath .. ".previous"
+	local ok, reason = pcall(function()
+		local file = assert(fs.open(staged, "w"))
+		file.write(downloadedUpdate)
+		file.close()
+		local check = assert(fs.open(staged, "r"))
+		local contents = check.readAll()
+		check.close()
+		assert(contents == downloadedUpdate, "download verification failed")
+		if fs.exists(backup) then fs.delete(backup) end
+		fs.move(programPath, backup)
+		local moved, moveError = pcall(fs.move, staged, programPath)
+		if not moved then
+			fs.move(backup, programPath)
+			error(moveError, 0)
+		end
+	end)
+	if ok then
+		updateInstalled = true
+		downloadedUpdate = nil
+		updateStatus = "Installed. Press Ctrl+R when ready to reboot."
+	else
+		updateStatus = "Install failed. See the computer terminal."
+		print("[Corewatch] Update failed: " .. tostring(reason))
+	end
+end
+
+local SPLASH_DURATION = 4
+local VERSION
+local reactorTypes = {
+	{"BigReactors-Reactor", "BIG"},
+	{"bigger-reactor", "BIGGERv1"},
+	{"BiggerReactors_Reactor", "BIGGERv2"},
+}
+
+local function discoverReactor()
+	for _, entry in ipairs(reactorTypes) do
+		local device = peripheral.find(entry[1])
+		if device then
+			local api = entry[2]
+			if api == "BIG" and device.mbIsConnected and device.mbIsAssembled then
+				api = "EXTREME"
+			end
+			if device.getEnergyStats then
+				local ok, energy = pcall(device.getEnergyStats)
+				if ok and energy.energyCapacity then rfTotalMax = energy.energyCapacity end
+			elseif api == "BIGGERv2" then
+				rfTotalMax = device.battery().capacity()
+			end
+			return device, api
+		end
+	end
+end
+local function applyCorewatchPalette(monitor)
+	monitor.setPaletteColor(colors.black, 0x101923)
+	monitor.setPaletteColor(colors.gray, 0x33485B)
+	monitor.setPaletteColor(colors.lightGray, 0xA5B9CB)
+	monitor.setPaletteColor(colors.white, 0xEAF4FF)
+	monitor.setPaletteColor(colors.cyan, 0x70E5F4)
+	monitor.setPaletteColor(colors.lime, 0x47CFD2)
+	monitor.setPaletteColor(colors.blue, 0x235885)
+	monitor.setPaletteColor(colors.lightBlue, 0x326A99)
+	monitor.setPaletteColor(colors.purple, 0x744E9B)
+	monitor.setPaletteColor(colors.green, 0x237E59)
+	monitor.setPaletteColor(colors.red, 0xC54B5D)
+	monitor.setPaletteColor(colors.orange, 0xFFBC64)
+end
+
+local function showStartup(monitor, message, detail, hint, progress)
+	monitor.setTextScale(0.5)
+	monitor.setBackgroundColor(colors.black)
+	monitor.clear()
+	local width, height = monitor.getSize()
+	local middle = math.floor(height / 2)
+
+	local function center(row, text, color)
+		monitor.setTextColor(color)
+		monitor.setCursorPos(math.max(1, math.floor((width - #text) / 2) + 1), row)
+		monitor.write(text:sub(1, width))
+	end
+
+	center(middle - 6, "C O R E W A T C H", colors.cyan)
+	center(middle - 4, "v" .. COREWATCH_VERSION, colors.lightGray)
+	center(middle, message, progress and colors.white or colors.red)
+	if progress then
+		local barWidth = math.min(30, width - 2)
+		local filled = math.floor(barWidth * progress)
+		center(middle + 2, "[" .. string.rep("#", filled) .. string.rep("-", barWidth - filled) .. "]", colors.lime)
+	end
+	center(middle + 4, detail, colors.lightGray)
+	center(middle + 6, hint, colors.lightGray)
+end
+
+print("Corewatch v" .. COREWATCH_VERSION)
+
+monitors[1] = peripheral.find("monitor")
+local startupMonitor = monitors[1]
+if not startupMonitor then
+	error("No monitor detected. Recommended: 4-wide by 3-tall Advanced Monitors. Attach the display directly or enable its wired modem.", 0)
+end
+
+applyCorewatchPalette(startupMonitor)
+local splashStarted = os.clock()
+print("[Corewatch] Looking for a reactor port.")
+for attempt = 1, 5 do
+	showStartup(startupMonitor, "SCANNING FOR REACTOR", "Checking connected peripherals...",
+		"Waiting for the reactor port...",
+		math.min(1, (os.clock() - splashStarted) / SPLASH_DURATION))
+	reactors[1], VERSION = discoverReactor()
+	if reactors[1] then break end
+	sleep(1)
+end
+if not reactors[1] then
+	showStartup(startupMonitor, "REACTOR NOT DETECTED",
+		"Check the cable to the Reinforced Computer Port.",
+		"Enable the port modem, then reboot with Ctrl+R.")
+	error("[Corewatch] No reactor link. Check the cable and enable the wired modem on the Reinforced Computer Port. Run peripherals to see what this computer can reach, then reboot with Ctrl+R.", 0)
+end
+
+local elapsed = os.clock() - splashStarted
+while elapsed < SPLASH_DURATION do
+	showStartup(startupMonitor, "REACTOR LINK ESTABLISHED", "Starting dashboard...", "", elapsed / SPLASH_DURATION)
+	sleep(math.min(0.5, SPLASH_DURATION - elapsed))
+	elapsed = os.clock() - splashStarted
+end
+print("[Corewatch] Reactor link ready. Opening dashboard.")
+local mon = monitors[1]
+local dashboard
+local displayedRows = {}
+
+term.redirect(mon)
+mon.setBackgroundColor(colors.black)
+mon.clear()
+
+local soundEnabled = true
+local lowFuelAlerted = false
+local soundCues = {
+	tap = {"hat", 1.0, 12},
+	ready = {"bell", 1.5, 16},
+	warning = {"bass", 3.0, 5},
+}
+
+local function playCue(name)
+	if not soundEnabled then return end
+	local speaker = peripheral.find("speaker")
+	if speaker then
+		pcall(speaker.playNote, table.unpack(soundCues[name]))
+	end
+end
+
+local function checkFuelWarning(percent)
+	if percent < 5 then
+		if not lowFuelAlerted then
+			lowFuelAlerted = true
+			playCue("warning")
+		end
+	else
+		lowFuelAlerted = false
+	end
+end
+
+local function clearTable()
+	button = {}
+end
+
+local function setButton(id, title, callback, left, top, right, bottom, arg, amount, color)
+	button[id] = {
+		title = title, func = callback, xmin = math.floor(left), ymin = math.ceil(top),
+		xmax = math.floor(right), ymax = math.floor(bottom), elem = arg, elem2 = amount, color = color,
+	}
+end
+function fill(color, buttonData, accent, display)
+	display = display or mon
+	local x = math.floor(buttonData.xmin)
+	local width = math.floor(buttonData.xmax) - x + 1
+	local top = math.ceil(buttonData.ymin)
+	local bottom = math.floor(buttonData.ymax)
+	local middle = math.floor((top + bottom) / 2)
+	local title = buttonData.title:sub(1, width)
+	local padding = math.floor((width - #title) / 2)
+
+	local blank = string.rep(" ", width)
+	local label = string.rep(" ", padding) .. title .. string.rep(" ", width - padding - #title)
+	local foreground = string.rep(colors.toBlit(colors.white), width)
+	local background = string.rep(colors.toBlit(color), width)
+	if accent then
+		background = colors.toBlit(accent) .. background:sub(2)
+	end
+
+	for row = top, bottom do
+		display.setCursorPos(x, row)
+		display.blit(row == middle and label or blank, foreground, background)
+	end
+end
+
+
+local fuelSamples = {}
+local fuelPercent
+local fuelMinutesLeft
+
+local function updateFuelGauge(stats)
+   if not stats.fuelCapacity or stats.fuelCapacity <= 0 or not stats.fuelAmount then
+      fuelPercent, fuelMinutesLeft = nil, nil
+      return
+   end
+
+   fuelPercent = math.floor(100 * stats.fuelAmount / stats.fuelCapacity + 0.5)
+   checkFuelWarning(fuelPercent)
+   local now = os.clock()
+   fuelSamples[#fuelSamples + 1] = {time = now, burn = stats.fuelPerTick}
+   while fuelSamples[1].time <= now - 60 do
+      table.remove(fuelSamples, 1)
+   end
+
+   local totalBurn = 0
+   for _, sample in ipairs(fuelSamples) do
+      totalBurn = totalBurn + sample.burn
+   end
+
+   fuelMinutesLeft = nil
+   if totalBurn > 0 then
+      local burnPerTick = totalBurn / #fuelSamples
+      fuelMinutesLeft = stats.fuelAmount / (burnPerTick * 20 * 60)
+   end
+end
+
+local function readPowerState()
+	local getActive = reactors[1].getActive
+	if getActive then
+		local ok, active = pcall(getActive)
+		if ok and type(active) == "boolean" then return active end
+	end
+end
+
+local function renderControls(mon, reactorActive)
+   local status = "REACTOR UNKNOWN"
+   local statusColor = colors.lightGray
+   if reactorActive ~= nil then
+      status = reactorActive and "REACTOR RUNNING" or "REACTOR OFF"
+      statusColor = reactorActive and colors.lime or colors.red
+   end
+   if controlMode == "STANDBY" and reactorActive ~= nil then
+      if not standbyArmed then
+         status, statusColor = "STANDBY DISARMED", colors.lightGray
+      elseif reactorActive then
+         status, statusColor = "STANDBY RUNNING", colors.lime
+      else
+         status, statusColor = "STANDBY ARMED", colors.cyan
+      end
+   end
+   mon.setCursorPos(controlsSize.inX, controlsSize.startY)
+   mon.setBackgroundColor(colors.black)
+   mon.setTextColor(statusColor)
+   mon.write(status .. string.rep(" ", #"STANDBY DISARMED" - #status))
+
+   local throttle = "STATE UNAVAILABLE"
+   if controlMode == "STANDBY" and reactorActive ~= nil then
+      if not standbyArmed then
+         throttle = "AUTO START DISABLED"
+      elseif reactorActive then
+         throttle = "RUNNING UNTIL MAX"
+      else
+         if bufferPercent <= minPowerRod then
+            throttle = "STARTING AT MIN"
+         elseif not netBufferRate then
+            throttle = "MEASURING BUFFER"
+         elseif netBufferRate >= 0.5 then
+            throttle = "BUFFER FILLING"
+         elseif netBufferRate > -0.5 then
+            throttle = "BUFFER STEADY"
+         else
+            local remainingRF = (bufferPercent - minPowerRod) * rfTotalMax / 100
+            local seconds = remainingRF / (-netBufferRate * 20)
+            if seconds < 60 then
+               throttle = "START IN ~" .. math.ceil(seconds) .. "s"
+            elseif seconds < 3600 then
+               throttle = "START IN ~" .. math.ceil(seconds / 60) .. "m"
+            elseif seconds < 86400 then
+               throttle = "START IN ~" .. math.ceil(seconds / 3600) .. "h"
+            else
+               throttle = "START IN ~" .. math.ceil(seconds / 86400) .. "d"
+            end
+         end
+      end
+   elseif reactorActive == false then
+      throttle = "OUTPUT DISABLED"
+   elseif reactorActive and controlMode == "MANUAL" then
+      throttle = "MANUAL ROD CONTROL"
+   elseif reactorActive then
+      if bufferPercent >= maxPowerRod then
+         throttle = "BUFFER AT TARGET"
+      elseif controlMode == "TARGET RF/t" then
+         throttle = "TRACKING RF TARGET"
+      elseif controlMode == "LOAD MATCH" then
+         if netBufferRate == nil then
+            throttle = "MEASURING BUFFER"
+         elseif bufferPercent < minPowerRod then
+            throttle = "BUILDING RESERVE"
+         else
+            throttle = "MATCHING BASE LOAD"
+         end
+      elseif bufferPercent <= minPowerRod then
+         throttle = "FULL OUTPUT REQUEST"
+      else
+         throttle = "THROTTLING OUTPUT"
+      end
+   end
+   mon.setCursorPos(controlsSize.inX, controlsSize.inY + 4)
+   mon.setTextColor(colors.lightGray)
+   mon.write(throttle .. string.rep(" ", math.max(0, #"FULL OUTPUT REQUEST" - #throttle)))
+
+   local fuelLabel = fuelPercent and ("FUEL " .. fuelPercent .. "%") or "FUEL --%"
+   if reactorActive and fuelMinutesLeft then
+      if fuelMinutesLeft < 1 then
+         fuelLabel = fuelLabel .. " <1m left"
+      elseif fuelMinutesLeft < 60 then
+         fuelLabel = fuelLabel .. " ~" .. math.floor(fuelMinutesLeft) .. "m left"
+      elseif fuelMinutesLeft < 1440 then
+         fuelLabel = fuelLabel .. " ~" .. math.floor(fuelMinutesLeft / 60) .. "h left"
+      else
+         fuelLabel = fuelLabel .. " ~" .. math.floor(fuelMinutesLeft / 1440) .. "d left"
+      end
+   elseif reactorActive and fuelPercent then
+      fuelLabel = fuelLabel .. " (idle)"
+   end
+   mon.setCursorPos(numbersSize.inX, numbersSize.inY + 6)
+   local fuelColor = colors.white
+   if fuelPercent and fuelPercent < 5 then
+      fuelColor = colors.red
+   elseif fuelPercent and fuelPercent < 15 then
+      fuelColor = colors.orange
+   end
+   mon.setTextColor(fuelColor)
+   mon.write(fuelLabel .. string.rep(" ", math.max(0, math.floor(numbersSize.width) + 1 - #fuelLabel)))
+
+   local x = math.floor(controlsSize.inX)
+   local y = button["low-10"].ymin - 3
+   local width = math.floor(controlsSize.endX) - x
+   mon.setBackgroundColor(colors.black)
+   for row = y, y + 1 do
+      mon.setCursorPos(x, row)
+      mon.write(string.rep(" ", width))
+   end
+   if controlMode == "MANUAL" then
+      mon.setCursorPos(x, y)
+      mon.setTextColor(colors.lightGray)
+      mon.write("ADJUST ROD INSERTION")
+   else
+      local leftLabel = math.floor((button["low-10"].xmin + button["low-10"].xmax - 2) / 2)
+      local rightLabel = math.floor((button["high-10"].xmin + button["high-10"].xmax - 2) / 2)
+      mon.setTextColor(colors.lightBlue)
+      mon.setCursorPos(leftLabel, y)
+      mon.write(controlMode == "TARGET RF/t" and "SET RF/t" or "MIN")
+      local left = button["low-10"]
+      local right = button["high-10"]
+      local leftValue = controlMode == "TARGET RF/t" and tostring(targetOutput) or minPowerRod .. "%"
+      fill(colors.lightBlue, {xmin = left.xmin, xmax = left.xmax, ymin = y + 1, ymax = y + 1, title = leftValue}, nil, mon)
+      mon.setTextColor(colors.purple)
+      mon.setCursorPos(rightLabel, y)
+      mon.write("MAX")
+      fill(colors.purple, {xmin = right.xmin, xmax = right.xmax, ymin = y + 1, ymax = y + 1, title = maxPowerRod .. "%"}, nil, mon)
+   end
+
+   button.ON.title = controlMode == "STANDBY" and "ARM" or "ON"
+   button.OFF.title = controlMode == "STANDBY" and "DISARM" or "OFF"
+   button.MODE.title = "MODE: " .. controlMode
+   button["low-10"].title = controlMode == "TARGET RF/t" and "-50 RF/t" or "-10%"
+   button["low+10"].title = controlMode == "TARGET RF/t" and "+50 RF/t" or "+10%"
+   button["high-10"].title = controlMode == "MANUAL" and "-1%" or "-10%"
+   button["high+10"].title = controlMode == "MANUAL" and "+1%" or "+10%"
+   for name, data in pairs(button) do
+      local color = data["color"]
+      local accent
+      if name == "ON" or name == "OFF" then
+         color = colors.gray
+         local selectedState = reactorActive
+         if controlMode == "STANDBY" then selectedState = standbyArmed end
+         if selectedState ~= nil and (name == "ON") == selectedState then
+            accent = colors.lime
+         end
+      end
+      fill(color, data, accent, mon)
+   end
+end
+
+
+local function checkxy(x, y)
+	for id, control in pairs(button) do
+		if x >= control.xmin and x <= control.xmax and y >= control.ymin and y <= control.ymax then
+			control.func(control.elem, control.elem2)
+			playCue("tap")
+			return id
+		end
+	end
+end
+
+local function resetDraw()
+	filleds, boxes, lines, texts = {}, {}, {}, {}
+end
+
+local function paintDashboard(reactorActive)
+	for _, rect in ipairs(filleds) do
+		paintutils.drawFilledBox(rect[1], rect[2] + 1, rect[3], rect[4] + 1, rect[5])
+	end
+	for _, rect in ipairs(boxes) do
+		paintutils.drawBox(table.unpack(rect))
+	end
+	for _, segment in ipairs(lines) do
+		paintutils.drawLine(table.unpack(segment))
+	end
+	for _, item in ipairs(texts) do
+		dashboard.setCursorPos(item[1], item[2])
+		dashboard.setTextColor(item[4])
+		dashboard.setBackgroundColor(item[5])
+		dashboard.write(item[3])
+	end
+	renderControls(dashboard, reactorActive)
+end
+
+local function draw(sample)
+	local reactorActive
+	if sample then
+		reactorActive = sample.active
+	else
+		reactorActive = readPowerState()
+	end
+
+	-- Compose into a hidden window and send only changed rows to the monitor.
+	local previous = term.redirect(dashboard)
+	local ok, reason = pcall(paintDashboard, reactorActive)
+	term.redirect(previous)
+	if not ok then error(reason, 0) end
+
+	local _, height = dashboard.getSize()
+	for y = 1, height do
+		local characters, foreground, background = dashboard.getLine(y)
+		local row = displayedRows[y]
+		if not row or row[1] ~= characters or row[2] ~= foreground or row[3] ~= background then
+			mon.setCursorPos(1, y)
+			mon.blit(characters, foreground, background)
+			displayedRows[y] = {characters, foreground, background}
+		end
+	end
+	resetDraw()
+end
+
+local function showUpdates()
+	showingUpdates = true
+	mon.setBackgroundColor(colors.black)
+	mon.clear()
+	local width = mon.getSize()
+	mon.setTextColor(colors.cyan)
+	mon.setCursorPos(3, 2)
+	mon.write("COREWATCH / UPDATES")
+	fill(colors.blue, {xmin = width - 10, xmax = width - 1, ymin = 1, ymax = 3, title = "BACK"})
+	mon.setTextColor(colors.white)
+	mon.setCursorPos(3, 5)
+	mon.write("INSTALLED: v" .. COREWATCH_VERSION)
+	mon.setCursorPos(3, 7)
+	mon.write(updateStatus:sub(1, width - 4))
+	fill(colors.blue, {xmin = 3, xmax = 16, ymin = 10, ymax = 12, title = "CHECK"})
+	fill(downloadedUpdate and colors.green or colors.gray,
+		{xmin = 19, xmax = 32, ymin = 10, ymax = 12, title = "INSTALL"})
+	fill(colors.blue, {xmin = 3, xmax = 24, ymin = 15, ymax = 17,
+		title = checkAtBoot and "BOOT CHECK ON" or "BOOT CHECK OFF"})
+	mon.setCursorPos(3, 20)
+	mon.setTextColor(colors.lightGray)
+	mon.write("Updates keep your settings and apply at the next reboot.")
+end
+
+local function showInfo(page)
+	infoPage = page or 1
+	showingInfo = true
+	mon.setBackgroundColor(colors.black)
+	mon.clear()
+	local width, height = mon.getSize()
+	local row = 2
+
+	local function line(text, color)
+		mon.setCursorPos(3, row)
+		mon.setTextColor(color or colors.white)
+		mon.write(text:sub(1, width - 4))
+		row = row + 1
+	end
+
+	line("COREWATCH INFO  v" .. COREWATCH_VERSION .. "  " .. infoPage .. "/2", colors.cyan)
+	row = 5
+	local function section(title)
+		mon.setBackgroundColor(colors.gray)
+		line((" " .. title):sub(1, width - 4) .. string.rep(" ", math.max(0, width - 5 - #title)), colors.cyan)
+		mon.setBackgroundColor(colors.black)
+	end
+
+	if infoPage == 1 then
+		section("CONTROLS & MODES")
+		line("Tap MODE to switch. ON / OFF controls reactor power.")
+		row = row + 1
+
+		line("AUTO", colors.cyan)
+		line("  Blue sets MIN, where throttling begins.")
+		line("  Purple sets MAX, where rods reach 100% insertion.")
+		line("  Tap MIN or MAX to type a percentage.")
+		row = row + 1
+
+		line("MANUAL", colors.cyan)
+		line("  Holds the rods. Adjust with -10%, +10%, -1%, or +1%.")
+		row = row + 1
+
+		line("TARGET RF/t", colors.cyan)
+		line("  Tap the setpoint to type it. Blue buttons step by 50 RF/t.")
+		line("  Purple sets MAX. At MAX, rods go to 100% insertion.")
+		row = row + 1
+
+		line("STANDBY", colors.cyan)
+		line("  ARM waits with the reactor off until MIN, then runs to MAX.")
+		line("  Blue sets MIN. Purple sets MAX. DISARM disables auto-starts.")
+		line("  The countdown estimates time to MIN from recent buffer drain.")
+		row = row + 1
+
+		line("LOAD MATCH", colors.cyan)
+		line("  Tracks estimated demand to keep NET near zero.")
+		line("  MIN builds a reserve. MAX caps fill. ON/OFF control power.")
+		row = row + 1
+
+		line("BOOT MODE", colors.cyan)
+		line("  Open MODE > BOOT MODE and choose a mode for future launches.")
+		line("  Auto is the default. Saving a choice leaves this run alone.")
+		line("  Standby starts disarmed on reboot. Tap ARM to enable it.")
+		line("  Corewatch also remembers your Target RF/t setpoint.")
+
+	else
+		section("OUTPUT & STORAGE")
+		line("OUTPUT: teal trace shows generation in RF/t, sampled every 2s.")
+		line("PEAK: highest output in view. The graph scales to that peak.")
+		line("STORED: energy and fill percentage in the reactor's buffer.")
+		line("Storage ticks: blue is MIN and purple is MAX.")
+		line("Target RF/t shows only MAX. Manual hides both markers.")
+		line("NET: buffer filling (+) or draining (-). RF OUT: export estimate.")
+		line("ROD INSERTION: higher insertion lowers output.")
+
+		row = row + 1
+		section("FUEL")
+		line("mB/t is fuel burn. RF/mB is energy generated per mB burned.")
+		line("Fuel time uses up to 60 seconds of recent burn readings.")
+		line("Orange means below 15% fuel. Red means below 5%.")
+		line("With the reactor off, the fuel gauge shows percentage only.")
+		line("Waste turns orange at 25% of reactor fuel capacity.")
+
+		row = row + 1
+		section("DISPLAY & REACTOR LINK")
+		line("Recommended: 4-wide by 3-tall Advanced Monitors.")
+		line("If the link drops, controls pause until the same port returns.")
+		line("Check the wired modem on the Reinforced Computer Port.")
+		line("After a lost link, tap ARM to re-arm Standby.")
+		line("Optional speaker: toggle sound from the MODE menu.")
+
+	end
+
+	fill(colors.blue, {xmin = width - 16, xmax = width - 2, ymin = height - 3, ymax = height - 1,
+		title = infoPage == 1 and "NEXT >" or "< PREVIOUS"})
+
+	fill(downloadedUpdate and colors.green or colors.blue, {xmin = width - 39, xmax = width - 25,
+		ymin = 1, ymax = 3, title = downloadedUpdate and "UPDATE READY" or "UPDATES"})
+	fill(colors.blue, {xmin = width - 22, xmax = width - 13, ymin = 1, ymax = 3, title = "STATS"})
+	mon.setBackgroundColor(colors.blue)
+	mon.setTextColor(colors.white)
+	for y = 1, 3 do
+		mon.setCursorPos(width - 10, y)
+		mon.write(y == 2 and "   BACK   " or "          ")
+	end
+	mon.setBackgroundColor(colors.black)
+end
+
+local function showSessionStats()
+	showingStats = true
+	mon.setBackgroundColor(colors.black)
+	mon.clear()
+	local width, height = mon.getSize()
+	local function line(y, value, color)
+		mon.setCursorPos(3, y)
+		mon.setTextColor(color or colors.white)
+		mon.write(value)
+	end
+
+	if confirmSessionReset then
+		line(2, "COREWATCH / NEW SESSION", colors.cyan)
+		line(6, "Clear the session total and all per-mode stats?")
+		line(8, "The reactor keeps its current mode and settings.", colors.lightGray)
+		fill(colors.gray, {xmin = 3, xmax = 17, ymin = height - 3, ymax = height - 1, title = "CANCEL"})
+		fill(colors.red, {xmin = width - 18, xmax = width - 2, ymin = height - 3, ymax = height - 1, title = "RESET STATS"})
+		return
+	end
+
+	line(2, statsByMode and "COREWATCH / STATS BY MODE" or "COREWATCH / SESSION TOTAL", colors.cyan)
+	fill(colors.blue, {xmin = width - 24, xmax = width - 13, ymin = 1, ymax = 3,
+		title = statsByMode and "TOTAL" or "BY MODE"})
+	fill(colors.blue, {xmin = width - 10, xmax = width - 1, ymin = 1, ymax = 3, title = "BACK"})
+	line(5, "ESTIMATES SINCE COREWATCH STARTED", colors.lightGray)
+
+	local function efficiency(totals)
+		return totals.fuel > 0 and (format_num(totals.energy / totals.fuel, 0) .. " RF/mB") or "--"
+	end
+
+	local function running(totals)
+		if not totals.powerSeconds or totals.powerSeconds == 0 then return "--" end
+		local duty = totals.runningSeconds * 100 / totals.powerSeconds
+		return format_num(totals.runningSeconds / 60, 1) .. " min on   |   Duty " .. format_num(duty, 1) .. "%"
+	end
+
+	if statsByMode then
+		for i, mode in ipairs(modeOptions) do
+			local y = 7 + (i - 1) * 4
+			local totals = session.modes[mode]
+			line(y, mode, colors.cyan)
+			if totals then
+				line(y + 1, "  " .. format_num(totals.energy, 0) .. " RF generated   |   " .. format_num(totals.fuel, 3) .. " mB burned")
+				line(y + 2, "  " .. format_num(totals.seconds / 60, 1) .. " min sampled   |   Avg " .. efficiency(totals))
+				line(y + 3, "  " .. running(totals))
+			else
+				line(y + 1, "  No samples yet", colors.lightGray)
+			end
+		end
+	else
+		line(7, "ALL MODES COMBINED", colors.cyan)
+		line(10, "ENERGY GENERATED  " .. format_num(session.energy, 0) .. " RF")
+		line(12, "FUEL BURNED       " .. format_num(session.fuel, 3) .. " mB")
+		line(14, "AVG EFFICIENCY    " .. efficiency(session))
+		line(16, "TIME SAMPLED      " .. format_num(session.seconds / 60, 1) .. " min")
+		line(18, "RUNNING TIME      " .. running(session))
+	end
+	line(29, "Totals use periodic readings and skip link outages.", colors.lightGray)
+	line(30, "Start a new session to compare a fresh run.", colors.lightGray)
+	fill(colors.blue, {xmin = width - 18, xmax = width - 2, ymin = height - 3, ymax = height - 1, title = "NEW SESSION"})
+end
+
+local function sampleSession(stats)
+	local now = os.clock()
+	local previous = session.last
+	if previous then
+		local elapsed = now - previous.time
+		local output = previous.mode == controlMode and stats.rfPerTick or previous.output
+		local burn = previous.mode == controlMode and stats.fuelPerTick or previous.burn
+		local energy = (previous.output + output) * elapsed * 10
+		local fuel = (previous.burn + burn) * elapsed * 10
+		local modeTotals = session.modes[previous.mode] or {energy = 0, fuel = 0, seconds = 0}
+		modeTotals.energy = modeTotals.energy + energy
+		modeTotals.fuel = modeTotals.fuel + fuel
+		modeTotals.seconds = modeTotals.seconds + elapsed
+		session.modes[previous.mode] = modeTotals
+		session.energy = session.energy + energy
+		session.fuel = session.fuel + fuel
+		session.seconds = session.seconds + elapsed
+
+		if previous.active ~= nil then
+			local runningSeconds = previous.active and elapsed or 0
+			modeTotals.runningSeconds = (modeTotals.runningSeconds or 0) + runningSeconds
+			modeTotals.powerSeconds = (modeTotals.powerSeconds or 0) + elapsed
+			session.runningSeconds = (session.runningSeconds or 0) + runningSeconds
+			session.powerSeconds = (session.powerSeconds or 0) + elapsed
+		end
+	end
+	session.last = {time = now, output = stats.rfPerTick, burn = stats.fuelPerTick, mode = controlMode, active = stats.active}
+end
+
+local function showModeMenu()
+	showingModes = true
+	mon.setBackgroundColor(colors.black)
+	mon.clear()
+	local width = mon.getSize()
+	mon.setTextColor(colors.cyan)
+	mon.setCursorPos(3, 2)
+	mon.write(choosingBootMode and "COREWATCH / CHOOSE BOOT MODE" or "COREWATCH MODE")
+	if not choosingBootMode then
+		fill(colors.blue, {xmin = width - 25, xmax = width - 13, ymin = 1, ymax = 3, title = "BOOT MODE"})
+		fill(colors.blue, {xmin = width - 40, xmax = width - 28, ymin = 1, ymax = 3,
+			title = soundEnabled and "SOUND ON" or "SOUND OFF"})
+	end
+	mon.setCursorPos(3, 31)
+	mon.setTextColor(colors.lightGray)
+	if choosingBootMode then
+		mon.write("Applies on next boot. Standby starts disarmed.")
+	else
+		mon.write("Saved boot mode: " .. bootMode)
+	end
+	fill(colors.blue, {xmin = width - 10, xmax = width - 1, ymin = 1, ymax = 3, title = "BACK"})
+
+	local descriptions = {
+		"Adjust rods based on MIN and MAX buffer fill.",
+		"Hold the rods and adjust insertion yourself.",
+		"Track an RF/t setpoint. MAX is the buffer ceiling.",
+		"Start at MIN. Stop at MAX. DISARM stops auto-start.",
+		"Keep NET near zero. MIN reserves power; MAX caps fill."
+	}
+	for i, mode in ipairs(modeOptions) do
+		local y = 5 + (i - 1) * 5
+		fill(colors.gray, {xmin = 3, xmax = 18, ymin = y, ymax = y + 2, title = mode},
+			(choosingBootMode and bootMode or controlMode) == mode and colors.lime or nil)
+		mon.setTextColor(colors.lightGray)
+		mon.setCursorPos(21, y + 1)
+		mon.write(descriptions[i]:sub(1, width - 21))
+	end
+end
+
+local function entryLimits()
+	if entryField == "MIN" then return minPowerRod, 0, maxPowerRod - 1, "%" end
+	if entryField == "MAX" then return maxPowerRod, minPowerRod + 1, 100, "%" end
+	return targetOutput, 50, 1000000, " RF/t"
+end
+
+local function showTargetPad()
+	local current, low, high, unit = entryLimits()
+	mon.setBackgroundColor(colors.black)
+	mon.clear()
+	local width = mon.getSize()
+	mon.setCursorPos(3, 2)
+	mon.setTextColor(colors.cyan)
+	mon.write("COREWATCH / SET " .. entryField)
+	mon.setCursorPos(3, 4)
+	mon.setTextColor(colors.white)
+	mon.write("CURRENT " .. current .. unit .. "    NEW " .. (targetEntry == "" and "_" or targetEntry))
+	mon.setCursorPos(3, 5)
+	mon.setTextColor(colors.lightGray)
+	mon.write("Enter " .. low .. " to " .. high .. unit .. ".")
+	targetKeys = {}
+	local function key(label, x, y, span, color)
+		local item = {xmin = x, xmax = x + span - 1, ymin = y, ymax = y + 2, title = label}
+		targetKeys[#targetKeys + 1] = item
+		fill(color, item)
+	end
+	local left = math.floor((width - 34) / 2) + 1
+	local labels = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "CLEAR", "0", "DEL"}
+	for i, label in ipairs(labels) do
+		local column, row = (i - 1) % 3, math.floor((i - 1) / 3)
+		key(label, left + column * 12, 7 + row * 4, 10, colors.gray)
+	end
+	local value = tonumber(targetEntry)
+	key("CANCEL", left, 24, 16, colors.gray)
+	key("APPLY", left + 18, 24, 16, value and value >= low and value <= high and colors.green or colors.gray)
+end
+
+local function handleTargetKey(x, y)
+	for _, key in ipairs(targetKeys) do
+		if x >= key.xmin and x <= key.xmax and y >= key.ymin and y <= key.ymax then
+			local label = key.title
+			if label == "CANCEL" then
+				playCue("tap")
+				return true
+			end
+			if label == "APPLY" then
+				local value = tonumber(targetEntry)
+				local _, low, high = entryLimits()
+				if value and value >= low and value <= high then
+					if entryField == "MIN" then
+						minPowerRod = value
+					elseif entryField == "MAX" then
+						maxPowerRod = value
+					else
+						targetOutput = value
+					end
+					saveSettings()
+					playCue("tap")
+					return true
+				end
+				return false
+			end
+			if label == "CLEAR" then
+				targetEntry = ""
+			elseif label == "DEL" then
+				targetEntry = targetEntry:sub(1, -2)
+			elseif #targetEntry < 7 then
+				targetEntry = targetEntry .. label
+			end
+			playCue("tap")
+			showTargetPad()
+			return false
+		end
+	end
+end
+
+function clickEvent()
+	local powerCheck
+	while true do
+		local event, side, x, y = os.pullEvent()
+		if event == "http_success" and side == UPDATE_URL and updatePending then
+			finishUpdateCheck(x)
+			if showingUpdates then showUpdates()
+			elseif showingInfo and not showingStats then showInfo(infoPage) end
+		elseif event == "http_failure" and side == UPDATE_URL and updatePending then
+			updatePending = false
+			if y then y.close() end
+			updateStatus = "GitHub check failed. Try again later."
+			if showingUpdates then showUpdates() end
+		elseif event == "timer" and side == powerCheck then
+			powerCheck = nil
+			if not showingInfo and not showingModes and not targetEntry then draw() end
+		elseif event == "monitor_touch" and side == peripheral.getName(mon) then
+			if targetEntry then
+				if handleTargetKey(x, y) then
+					targetEntry = nil
+					mon.clear()
+					buildDashboard()
+					draw()
+				end
+			elseif showingModes then
+				local width = mon.getSize()
+				local selected
+				if x >= 3 and x <= 18 and y >= 5 and (y - 5) % 5 <= 2 then
+					selected = modeOptions[math.floor((y - 5) / 5) + 1]
+				end
+				local back = x >= width - 10 and x <= width - 1 and y <= 3
+				if choosingBootMode then
+					if selected then
+						bootMode = selected
+						saveSettings()
+					end
+					if selected or back then
+						playCue("tap")
+						choosingBootMode = false
+						showModeMenu()
+					end
+				elseif x >= width - 40 and x <= width - 28 and y <= 3 then
+					soundEnabled = not soundEnabled
+					saveSettings()
+					playCue("tap")
+					showModeMenu()
+				elseif x >= width - 25 and x <= width - 13 and y <= 3 then
+					playCue("tap")
+					choosingBootMode = true
+					showModeMenu()
+				elseif selected or back then
+					playCue("tap")
+					showingModes = false
+					if selected and selected ~= controlMode then
+						controlMode = selected
+						standbyArmed = selected == "STANDBY"
+					end
+					mon.clear()
+					buildDashboard()
+					draw()
+				end
+			elseif showingInfo then
+				local width, height = mon.getSize()
+				if showingUpdates then
+					if x >= width - 10 and x <= width - 1 and y <= 3 then
+						showingUpdates = false
+						showInfo(infoPage)
+					elseif y >= 10 and y <= 12 and x >= 3 and x <= 16 then
+						checkForUpdate()
+						showUpdates()
+					elseif y >= 10 and y <= 12 and x >= 19 and x <= 32 and downloadedUpdate then
+						installUpdate()
+						showUpdates()
+					elseif y >= 15 and y <= 17 and x >= 3 and x <= 24 then
+						checkAtBoot = not checkAtBoot
+						saveSettings()
+						showUpdates()
+					end
+				elseif showingStats then
+					local footer = y >= height - 3 and y <= height - 1
+					local resetButton = footer and x >= width - 18 and x <= width - 2
+					if confirmSessionReset then
+						if resetButton then
+							playCue("tap")
+							session = {energy = 0, fuel = 0, seconds = 0, modes = {}}
+							confirmSessionReset = false
+							showSessionStats()
+						elseif footer and x >= 3 and x <= 17 then
+							confirmSessionReset = false
+							showSessionStats()
+						end
+					elseif resetButton then
+						playCue("tap")
+						confirmSessionReset = true
+						showSessionStats()
+					elseif x >= width - 10 and x <= width - 1 and y <= 3 then
+						showingStats = false
+						playCue("tap")
+						showInfo(infoPage)
+					elseif x >= width - 24 and x <= width - 13 and y <= 3 then
+						playCue("tap")
+						statsByMode = not statsByMode
+						showSessionStats()
+					end
+				elseif x >= width - 16 and x <= width - 2 and y >= height - 3 and y <= height - 1 then
+					playCue("tap")
+					showInfo(3 - infoPage)
+				elseif x >= width - 39 and x <= width - 25 and y <= 3 then
+					showUpdates()
+				elseif x >= width - 22 and x <= width - 13 and y <= 3 then
+					playCue("tap")
+					statsByMode = false
+					showSessionStats()
+				elseif x >= width - 10 and x <= width - 1 and y <= 3 then
+					playCue("tap")
+					showingInfo = false
+					mon.clear()
+					buildDashboard()
+					draw()
+				end
+			else
+				local left, right = button["low-10"], button["high-10"]
+				local targetRow = left.ymin - 3
+				entryField = nil
+				if controlMode ~= "MANUAL" and y >= targetRow and y <= targetRow + 1 then
+					if x >= left.xmin and x <= left.xmax then
+						entryField = controlMode == "TARGET RF/t" and "RF/t" or "MIN"
+					elseif x >= right.xmin and x <= right.xmax then
+						entryField = "MAX"
+					end
+				end
+				if entryField then
+					playCue("tap")
+					targetEntry = ""
+					showTargetPad()
+				else
+					local clicked = checkxy(x, y)
+					if clicked == "ON" or clicked == "OFF" then
+						draw()
+						powerCheck = os.startTimer(0.2)
+					elseif clicked and not showingInfo and not showingModes then
+						draw()
+					end
+				end
+			end
+		end
+	end
+end
+
+local function requestPower(enabled)
+	if enabled and controlMode == "STANDBY" then
+		standbyArmed = true
+		adjustRodsLevel()
+	else
+		if not enabled then standbyArmed = false end
+		reactors[1].setActive(enabled)
+	end
+end
+
+function adjustSelectedSetting(limit, number)
+	if controlMode == "TARGET RF/t" and limit == "min" then
+		targetOutput = math.max(50, math.min(1000000, targetOutput + number * 5))
+		saveSettings()
+		return
+	end
+	if controlMode == "MANUAL" then
+		local stats = readReactor()
+		local step = limit == "min" and number or number / 10
+		local level = math.max(0, math.min(100, stats.rodLevel + step))
+		setRodInsertion(level, stats.reactorRodsLevel)
+		return
+	end
+
+	if limit == "min" then
+		local candidate = minPowerRod + number
+		minPowerRod = math.max(0, math.min(maxPowerRod - 1, candidate))
+	else
+		local candidate = maxPowerRod + number
+		maxPowerRod = math.max(minPowerRod + 1, math.min(100, candidate))
+	end
+	saveSettings()
+	adjustRodsLevel()
+end
+
+function adjustRodsLevel(sample)
+	if controlMode == "MANUAL" then return end
+
+	local allStats = sample or readReactor()
+	local storedEnergy = allStats.rfTotal
+	local rodPositions = allStats.reactorRodsLevel
+
+	if controlMode == "STANDBY" then
+		if not standbyArmed then return end
+
+		local reactor = reactors[1]
+		local active = reactor.getActive()
+		local fillPercent = storedEnergy * 100 / rfTotalMax
+		if active and fillPercent >= maxPowerRod then
+			reactor.setActive(false)
+		elseif active or (fillPercent <= minPowerRod and fillPercent < maxPowerRod) then
+			if allStats.rodLevel ~= 0 then
+				setRodInsertion(0, rodPositions)
+			end
+			if not active then
+				reactor.setActive(true)
+			end
+		end
+		return
+	end
+
+	if controlMode == "TARGET RF/t" then
+		local reactor = reactors[1]
+		if not reactor.getActive() then return end
+		local level = allStats.rodLevel
+		if storedEnergy >= rfTotalMax * maxPowerRod / 100 then
+			if level ~= 100 then setRodInsertion(100, rodPositions) end
+			return
+		end
+		local errorRF = allStats.rfPerTick - targetOutput
+		if math.abs(errorRF) > math.max(5, targetOutput * 0.03) then
+			local step = math.min(5, math.ceil(math.abs(errorRF) / targetOutput * 5))
+			local nextLevel = math.max(0, math.min(100, level + (errorRF > 0 and step or -step)))
+			if nextLevel ~= level then setRodInsertion(nextLevel, rodPositions) end
+		end
+		return
+	end
+
+	if controlMode == "LOAD MATCH" then
+		local reactor = reactors[1]
+		if not reactor.getActive() then return end
+
+		local level = allStats.rodLevel
+		local fillPercent = storedEnergy * 100 / rfTotalMax
+		if fillPercent >= maxPowerRod then
+			if level < 100 then setRodInsertion(100, rodPositions) end
+		elseif estimatedExport ~= nil then
+			local output = allStats.rfPerTick
+			local reserveRate = fillPercent < minPowerRod and math.max(20, output * 0.05) or 0
+			local demand = estimatedExport + reserveRate
+			local errorRF = output - demand
+			if math.abs(errorRF) > math.max(10, demand * 0.03) then
+				-- Compare current generation with smoothed demand to reduce lag.
+				local rfPerRodPoint = math.max(5, output / math.max(1, 100 - level))
+				local step = math.max(1, math.min(8, math.floor(math.abs(errorRF) / rfPerRodPoint / 2)))
+				local nextLevel = math.max(0, math.min(100, level + (errorRF > 0 and step or -step)))
+				if nextLevel ~= level then setRodInsertion(nextLevel, rodPositions) end
+			end
+		end
+		return
+	end
+
+	local lower = rfTotalMax * minPowerRod / 100
+	local upper = rfTotalMax * maxPowerRod / 100
+	local fraction = math.max(0, math.min(1, (storedEnergy - lower) / (upper - lower)))
+	setRodInsertion(math.ceil(fraction * 100), rodPositions)
+end
+function setRodInsertion(insertion, currentPositions)
+	local port = reactors[1]
+	if VERSION ~= "EXTREME" then
+		port.setAllControlRodLevels(insertion)
+		return
+	end
+
+	for _, position in pairs(currentPositions) do
+		if position ~= insertion then
+			local requested = {}
+			for rodIndex in pairs(currentPositions) do
+				requested[rodIndex] = insertion
+			end
+			port.setControlRodsLevels(requested)
+			return
+		end
+	end
+end
+
+local function panel(left, top, right, bottom, margin, topPadding)
+	return {
+		startX = left, startY = top, endX = right, endY = bottom,
+		inX = left + margin + 1, inY = top + topPadding,
+		width = right - left - 2 * margin - 2,
+	}
+end
+
+local function frame(region, title, margin)
+	boxes[#boxes + 1] = {region.startX, region.startY, region.endX, region.endY, colors.gray}
+	if title then
+		local x, y = region.startX + 2 * margin, region.startY
+		lines[#lines + 1] = {x - margin, y, x + #title + 1, y, colors.black}
+		texts[#texts + 1] = {x, y, title, colors.cyan, colors.black}
+	end
+end
+
+function buildDashboard()
+	local width, height = mon.getSize()
+	dashboard = window.create(mon, 1, 1, width, height, false)
+	dashboard.setBackgroundColor(colors.black)
+	dashboard.clear()
+	displayedRows = {}
+	local margin = math.floor(width / 50)
+	local top = margin + 1
+	local leftEdge = (width - 2 * margin) * 2 / 3 - margin
+	local rightStart = leftEdge + margin + 1
+	local controlBottom = (height - 2 * margin) * 2 / 3 + 1
+
+	infosSize = panel(top, top, leftEdge, height - margin, margin, margin + 1)
+	controlsSize = panel(rightStart, top, width - margin, controlBottom, margin, margin)
+	numbersSize = panel(rightStart, controlBottom + margin + 1, width - margin, height - margin, margin, margin)
+	local sectionHeight = math.floor((infosSize.endY - top - 2 * margin - 2) / 3)
+	infosSize.graphHeight = sectionHeight + 4
+	infosSize.gaugeHeight = sectionHeight - 2
+	infosSize.storageY = infosSize.inY + infosSize.graphHeight + 1
+	infosSize.rodsY = infosSize.storageY + infosSize.gaugeHeight + 1
+	controlsSize.sectionHeight = math.floor((controlBottom - top - margin - 1) / 4)
+
+	frame(infosSize, "COREWATCH", margin)
+	frame(controlsSize)
+	frame(numbersSize, "FUEL", margin)
+
+	local infoRight = math.floor(leftEdge) - 2
+	setButton("INFO", "INFO", showInfo, infoRight - 9, infosSize.inY - 1, infoRight, infosSize.inY + 1, nil, nil, colors.blue)
+
+	local x, y = controlsSize.inX, controlsSize.inY
+	local right = x + controlsSize.width
+	local center = x + math.floor(controlsSize.width / 2)
+	local step = controlsSize.sectionHeight
+	setButton("ON", "ON", requestPower, x, y, center - 1, y + 2, true, nil, colors.green)
+	setButton("OFF", "OFF", requestPower, center + 2, y, right, y + 2, false, nil, colors.red)
+	setButton("MODE", "MODE", showModeMenu, x, y + step + 1, right, y + step + 2, nil, nil, colors.blue)
+	for i, change in ipairs({-10, 10}) do
+		local row = y + step * (i + 1) + 2
+		local suffix = change < 0 and "-10" or "+10"
+		setButton("low" .. suffix, suffix, adjustSelectedSetting, x + 1, row, center - 2, row + 2, "min", change, colors.lightBlue)
+		setButton("high" .. suffix, suffix, adjustSelectedSetting, center + 3, row, right - 1, row + 2, "max", change, colors.purple)
+	end
+end
+
+function readReactor()
+	local device = reactors[1]
+	if VERSION == "EXTREME" then
+		local energy = device.getEnergyStats()
+		local fuel = device.getFuelStats()
+		local rods = device.getControlRodsLevels()
+		return {
+			rfTotal = math.floor(energy.energyStored),
+			rfPerTick = math.floor(energy.energyProducedLastTick),
+			rodLevel = rods[0], reactorRodsLevel = rods,
+			fuelPerTick = fuel.fuelConsumedLastTick,
+			fuelAmount = fuel.fuelAmount, fuelCapacity = fuel.fuelCapacity,
+			wasteAmount = fuel.wasteAmount,
+		}
+	end
+	if VERSION == "BIGGERv2" then
+		local battery = device.battery()
+		return {
+			rfTotal = battery.stored(), rfPerTick = math.floor(battery.producedLastTick()),
+			rodLevel = math.floor(device.getControlRod(0).level()),
+			fuelPerTick = device.fuelTank().burnedLastTick(),
+		}
+	end
+	return {
+		rfTotal = math.floor(device.getEnergyStored()),
+		rfPerTick = math.floor(device.getEnergyProducedLastTick()),
+		rodLevel = math.floor(device.getControlRodLevel(0)),
+		fuelPerTick = device.getFuelConsumedLastTick(),
+	}
+end
+-- Queue the label and the bar together so zero readings render on the first draw.
+local function addReading(index, label, fraction)
+	local x = math.floor(infosSize.inX)
+	local y = index == 1 and infosSize.storageY or infosSize.rodsY
+	local width = math.floor(infosSize.width) + 1
+	local barTop = y + 1
+	local barBottom = y + infosSize.gaugeHeight - 2
+	local filledWidth = math.floor(width * math.max(0, math.min(1, fraction)))
+
+	table.insert(lines, {x, y, x + width - 1, y, colors.black})
+	table.insert(texts, {x, y, label, colors.white, colors.black})
+	table.insert(filleds, {x, barTop, x + width - 1, barBottom, colors.gray})
+	if filledWidth > 0 then
+		table.insert(filleds, {x, barTop, x + filledWidth - 1, barBottom, colors.lime})
+	end
+end
+
+local function addBufferMarkers()
+	if controlMode == "MANUAL" then return end
+
+	local x = math.floor(infosSize.inX)
+	local span = math.floor(infosSize.width)
+	local y = infosSize.storageY
+	local top = y + 2
+	local bottom = math.min(top + 1, y + infosSize.gaugeHeight - 1)
+	local minColumn = x + math.floor(span * minPowerRod / 100 + 0.5)
+	local maxColumn = x + math.floor(span * maxPowerRod / 100 + 0.5)
+
+	if controlMode ~= "TARGET RF/t" then
+		table.insert(lines, {minColumn, top, minColumn, bottom, colors.lightBlue})
+	end
+	table.insert(lines, {maxColumn, top, maxColumn, bottom, colors.purple})
+end
+
+local outputHistory = {}
+
+local function addOutputHistory(rfPerTick)
+	local x, y = math.floor(infosSize.inX), infosSize.inY
+	local width = math.floor(infosSize.width) + 1
+	local top = y + 2
+	local height = infosSize.graphHeight - 2
+	local pixelWidth, pixelHeight = width * 2, height * 3
+
+	outputHistory[#outputHistory + 1] = rfPerTick
+	if #outputHistory > pixelWidth then
+		table.remove(outputHistory, 1)
+	end
+
+	local peak = 0
+	for _, sample in ipairs(outputHistory) do
+		peak = math.max(peak, sample)
+	end
+
+	table.insert(lines, {x, y, x + width - 1, y, colors.black})
+	table.insert(texts, {x, y, "OUTPUT  " .. format_num(rfPerTick, 0) .. " RF/t  |  PEAK " .. format_num(peak, 0), colors.white, colors.black})
+	table.insert(filleds, {x, top - 1, x + width - 1, top + height - 2, colors.gray})
+
+	local cells = {}
+	local function plot(px, py)
+		local cell = math.floor(py / 3) * width + math.floor(px / 2)
+		local bit = 2 ^ ((py % 3) * 2 + px % 2)
+		cells[cell] = bit32.bor(cells[cell] or 0, bit)
+	end
+
+	local previousY
+	for i, sample in ipairs(outputHistory) do
+		local px = pixelWidth - #outputHistory + i - 1
+		local py = pixelHeight - 1 - math.floor((pixelHeight - 1) * sample / math.max(1, peak))
+		if previousY then
+			-- Adjacent samples occupy neighboring columns. Split the vertical span between them.
+			local middle = math.floor((previousY + py) / 2)
+			for row = math.min(previousY, middle), math.max(previousY, middle) do
+				plot(px - 1, row)
+			end
+			for row = math.min(middle, py), math.max(middle, py) do
+				plot(px, row)
+			end
+		else
+			plot(px, py)
+		end
+		previousY = py
+	end
+
+	for cell, mask in pairs(cells) do
+		-- The sixth subpixel is the background, so invert the glyph when it is lit.
+		local inverted = mask >= 32
+		local glyph = string.char(128 + (inverted and 63 - mask or mask))
+		local foreground = inverted and colors.gray or colors.lime
+		local background = inverted and colors.lime or colors.gray
+		table.insert(texts, {x + cell % width, top + math.floor(cell / width), glyph, foreground, background})
+	end
+end
+
+local reactorName = peripheral.getName(reactors[1])
+local linkLost = "Corewatch reactor link lost"
+
+local function reactorLinkReady()
+	if not peripheral.isPresent(reactorName) then
+		return false
+	end
+
+	local reactor = reactors[1]
+	if reactor.mbIsAssembled then
+		local ok, assembled = pcall(reactor.mbIsAssembled)
+		return ok and assembled == true
+	end
+
+	return true
+end
+
+local bufferSamples = {}
+
+local function addNetFlow(storedEnergy, production)
+	local now = os.clock()
+	bufferSamples[#bufferSamples + 1] = {time = now, energy = storedEnergy, production = production}
+	while #bufferSamples > 1 and bufferSamples[1].time < now - 10 do
+		table.remove(bufferSamples, 1)
+	end
+	local first = bufferSamples[1]
+	local label = "NET  -- RF/t"
+	local outputLabel = "RF OUT --"
+	local color = colors.lightGray
+	if now > first.time then
+		local rate = (storedEnergy - first.energy) / ((now - first.time) * 20)
+		netBufferRate = rate
+
+		local generated = 0
+		for i = 2, #bufferSamples do
+			local previous, sample = bufferSamples[i - 1], bufferSamples[i]
+			generated = generated + (previous.production + sample.production) * (sample.time - previous.time) / 2
+		end
+		local exported = math.max(0, generated / (now - first.time) - rate)
+		estimatedExport = exported
+		outputLabel = "RF OUT ~" .. format_num(exported, 0) .. " RF/t"
+		local magnitude = math.floor(math.abs(rate) + 0.5)
+		local sign = ""
+		if magnitude > 0 then
+			sign = rate > 0 and "+" or "-"
+			color = rate > 0 and colors.lime or colors.orange
+		end
+		label = "NET  " .. sign .. format_num(magnitude, 0) .. " RF/t"
+	end
+
+	local x = math.floor(infosSize.inX)
+	local y = infosSize.storageY + 1
+	table.insert(lines, {x, y, x + math.floor(infosSize.width), y, colors.black})
+	table.insert(texts, {x, y, label, color, colors.black})
+	local rightX = x + #label + 3
+	local available = x + math.floor(infosSize.width) - rightX + 1
+	if #outputLabel > available then
+		outputLabel = outputLabel:gsub(" RF/t$", "")
+	end
+	table.insert(texts, {rightX, y, outputLabel:sub(1, math.max(0, available)), colors.white, colors.black})
+end
+
+function refreshDashboard()
+	if not reactorLinkReady() then
+		error(linkLost, 0)
+	end
+	local stats = readReactor()
+	local bufferFraction = stats.rfTotal / rfTotalMax
+	bufferPercent = bufferFraction * 100
+	updateFuelGauge(stats)
+
+	addOutputHistory(stats.rfPerTick)
+	addNetFlow(stats.rfTotal, stats.rfPerTick)
+	adjustRodsLevel(stats)
+	stats.active = readPowerState()
+	sampleSession(stats)
+	if showingInfo or showingModes or targetEntry then
+		if showingStats then showSessionStats() end
+		resetDraw()
+		sleep(2)
+		return
+	end
+	addReading(1, "STORED  " .. format_num(stats.rfTotal, 0) .. " RF (" .. format_num(bufferFraction * 100, 1) .. "%)" .. (stats.rfTotal == 0 and " EMPTY" or ""), bufferFraction)
+	addBufferMarkers()
+	addReading(2, "ROD INSERTION  " .. stats.rodLevel .. "%", stats.rodLevel / 100)
+
+	local x, y = numbersSize.inX, numbersSize.inY + 2
+	table.insert(lines, {x, y, x + numbersSize.width, y, colors.black})
+	table.insert(texts, {x, y, format_num(stats.fuelPerTick, 3) .. " mB/t", colors.white, colors.black})
+
+	local efficiency = "EFF: --"
+	if stats.fuelPerTick > 0 then
+		efficiency = "EFF: " .. format_num(stats.rfPerTick / stats.fuelPerTick, 0) .. " RF/mB"
+	end
+	table.insert(lines, {x, y + 2, x + numbersSize.width, y + 2, colors.black})
+	table.insert(texts, {x, y + 2, efficiency, colors.white, colors.black})
+
+	if stats.wasteAmount ~= nil then
+		local wasteColor = colors.white
+		if stats.fuelCapacity and stats.fuelCapacity > 0 and stats.wasteAmount / stats.fuelCapacity >= 0.25 then
+			wasteColor = colors.orange
+		end
+		table.insert(lines, {x, y + 6, x + numbersSize.width, y + 6, colors.black})
+		table.insert(texts, {x, y + 6, "WASTE " .. format_num(stats.wasteAmount, 0) .. " mB", wasteColor, colors.black})
+	end
+
+	draw(stats)
+	sleep(2)
+end
+
+--
+-- Settings retain the existing MIN, MAX, optional RF/t line format.
+function saveSettings()
+	local handle = assert(fs.open(SETTINGS_FILE, "w"))
+	handle.writeLine(tostring(minPowerRod))
+	handle.writeLine(tostring(maxPowerRod))
+	handle.writeLine(tostring(targetOutput))
+	handle.writeLine(bootMode)
+	handle.writeLine(soundEnabled and "SOUND ON" or "SOUND OFF")
+	handle.writeLine(checkAtBoot and "UPDATE CHECK ON" or "UPDATE CHECK OFF")
+	handle.close()
+end
+
+local function loadSettings()
+	local handle = fs.open(SETTINGS_FILE, "r")
+	if not handle then
+		saveSettings()
+		return
+	end
+	local minimum = tonumber((handle.readLine()))
+	local maximum = tonumber((handle.readLine()))
+	local setpoint = tonumber((handle.readLine()))
+	local savedMode = handle.readLine()
+	local savedSound = handle.readLine()
+	local savedUpdateCheck = handle.readLine()
+	handle.close()
+	if minimum and maximum and minimum >= 0 and maximum <= 100 and minimum < maximum then
+		minPowerRod, maxPowerRod = minimum, maximum
+	end
+	if setpoint and setpoint >= 50 and setpoint <= 1000000 then
+		targetOutput = math.floor(setpoint)
+	end
+	soundEnabled = savedSound ~= "SOUND OFF"
+	checkAtBoot = savedUpdateCheck == "UPDATE CHECK ON"
+	for _, mode in ipairs(modeOptions) do
+		if savedMode == mode then
+			bootMode = mode
+			controlMode = mode
+			break
+		end
+	end
+end
+
+function format_num(value, precision)
+	local formatted = string.format("%." .. precision .. "f", value)
+	local sign, whole, decimal = formatted:match("^(-?)(%d+)(.*)$")
+	local grouped = whole:reverse():gsub("(%d%d%d)", "%1,"):gsub(",$", "")
+	return sign .. grouped:reverse() .. decimal
+end
+mon.setBackgroundColor(colors.black)
+mon.clear()
+mon.setTextScale(0.5)
+
+loadSettings()
+if checkAtBoot then checkForUpdate() end
+playCue("ready")
+
+
+local function runDashboard()
+	buildDashboard()
+	while true do
+		parallel.waitForAny(refreshDashboard, clickEvent)
+	end
+end
+
+-- Rebuild the dashboard after the original reactor port is usable again.
+while true do
+	local ok, reason = pcall(runDashboard)
+	if ok then
+		break
+	end
+	if reason == "Terminated" or (reason ~= linkLost and reactorLinkReady()) then
+		error(reason, 0)
+	end
+
+	showingInfo = false
+	showingUpdates = false
+	showingStats = false
+	confirmSessionReset = false
+	session.last = nil
+	showingModes = false
+	choosingBootMode = false
+	targetEntry = nil
+	standbyArmed = false
+	clearTable()
+	resetDraw()
+	playCue("warning")
+	showStartup(mon, "REACTOR LINK LOST",
+		"Controls paused. Check the reactor and wired modem.",
+		"Waiting for the original port to return...")
+
+	while true do
+		sleep(2)
+		local reactor = peripheral.wrap(reactorName)
+		if reactor then
+			reactors[1] = reactor
+			if reactorLinkReady() and pcall(readReactor) then
+				break
+			end
+		end
+	end
+
+	outputHistory = {}
+	bufferSamples = {}
+	netBufferRate = nil
+	estimatedExport = nil
+	fuelSamples = {}
+	playCue("ready")
+	mon.clear()
+end

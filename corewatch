@@ -1,6 +1,6 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
 -- Run corewatch to open the dashboard.
-local COREWATCH_VERSION = "1.16.3"
+local COREWATCH_VERSION = "1.16.4"
 
 local button = {}
 local filleds = {}
@@ -637,6 +637,7 @@ local function showInfo(page)
 		line("Target RF/t shows only MAX. Manual hides both markers.")
 		line("NET: buffer filling (+) or draining (-). RF OUT: export estimate.")
 		line("ROD INSERTION: higher insertion lowers output.")
+		line("FUEL / CASING: reactor temperatures in Celsius.")
 
 		row = row + 1
 		section("FUEL")
@@ -1221,6 +1222,13 @@ function buildDashboard()
 	end
 end
 
+local function readTemperature(method)
+	if method then
+		local ok, value = pcall(method)
+		if ok and type(value) == "number" then return value end
+	end
+end
+
 function readReactor()
 	local device = reactors[1]
 	if VERSION == "EXTREME" then
@@ -1234,6 +1242,8 @@ function readReactor()
 			fuelPerTick = fuel.fuelConsumedLastTick,
 			fuelAmount = fuel.fuelAmount, fuelCapacity = fuel.fuelCapacity,
 			wasteAmount = fuel.wasteAmount,
+			fuelTemperature = fuel.fuelTemperature or readTemperature(device.getFuelTemperature),
+			casingTemperature = readTemperature(device.getCasingTemperature),
 		}
 	end
 	if VERSION == "BIGGERv2" then
@@ -1429,6 +1439,16 @@ function refreshDashboard()
 	addReading(1, "STORED  " .. format_num(stats.rfTotal, 0) .. " RF (" .. format_num(bufferFraction * 100, 1) .. "%)" .. (stats.rfTotal == 0 and " EMPTY" or ""), bufferFraction)
 	addBufferMarkers()
 	addReading(2, "ROD INSERTION  " .. stats.rodLevel .. "%", stats.rodLevel / 100)
+
+	if VERSION == "EXTREME" then
+		local function temperature(value)
+			return type(value) == "number" and (format_num(value, 0) .. " C") or "--"
+		end
+		local x, y = math.floor(infosSize.inX), infosSize.rodsY + 1
+		table.insert(lines, {x, y, x + math.floor(infosSize.width), y, colors.black})
+		table.insert(texts, {x, y, "FUEL " .. temperature(stats.fuelTemperature)
+			.. "  |  CASING " .. temperature(stats.casingTemperature), colors.lightGray, colors.black})
+	end
 
 	local x, y = numbersSize.inX, numbersSize.inY + 2
 	table.insert(lines, {x, y, x + numbersSize.width, y, colors.black})

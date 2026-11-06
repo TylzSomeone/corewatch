@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.17.1"
+local COREWATCH_VERSION = "1.17.2"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -1746,16 +1746,66 @@ local function scan()
     end
 end
 
--- Keep the familiar four-second startup before any controller begins work.
-physical.setBackgroundColor(colors.black)
-physical.clear()
-physical.setTextColor(colors.cyan)
-physical.setCursorPos(math.max(1, math.floor(width / 2) - 7), math.floor(height / 2) - 1)
-physical.write("C O R E W A T C H")
-physical.setCursorPos(math.max(1, math.floor(width / 2) - 3), math.floor(height / 2) + 1)
-physical.write("v" .. COREWATCH_VERSION)
-sleep(4)
+-- One shared splash for the whole installation, not one delay per reactor.
+local function showFleetStartup(progress)
+    view.setBackgroundColor(colors.black)
+    view.clear()
+    local middle = math.floor(height / 2)
+    local function center(row, text, color)
+        view.setCursorPos(math.max(1, math.floor((width - #text) / 2) + 1), row)
+        view.setTextColor(color)
+        view.write(text:sub(1, width))
+    end
+    local available = 0
+    for _, record in ipairs(records) do
+        if peripheral.isPresent(record.port) then available = available + 1 end
+    end
+    local message, detail, hint
+    if available == 0 then
+        message = "WAITING FOR REACTOR PORTS"
+        detail = "No reactor ports currently reachable."
+        hint = "Enable wired modems on the Reinforced Computer Ports."
+    elseif migration then
+        message = "ASSIGN YOUR ORIGINAL REACTOR"
+        detail = available .. " reactor ports found. Choose your original on the next page."
+        hint = "Your existing settings will follow the reactor you select."
+    else
+        message = "REACTOR PORTS FOUND"
+        detail = available .. (available == 1 and " reactor port available." or " reactor ports available.")
+        hint = "Preparing independent controllers and dashboards..."
+    end
+    center(middle - 6, "C O R E W A T C H", colors.cyan)
+    center(middle - 4, "v" .. COREWATCH_VERSION, colors.lightGray)
+    center(middle, message, available == 0 and colors.orange or colors.white)
+    local barWidth = math.min(30, width - 6)
+    local filled = math.floor(barWidth * math.max(0, math.min(1, progress)))
+    center(middle + 2, "[" .. string.rep("#", filled) .. string.rep("-", barWidth - filled) .. "]", colors.lime)
+    center(middle + 4, detail, colors.lightGray)
+    center(middle + 6, hint, colors.lightGray)
+    for y = 1, height do
+        local chars, foreground, background = view.getLine(y)
+        local row = displayed[y]
+        if not row or row[1] ~= chars or row[2] ~= foreground or row[3] ~= background then
+            physical.setCursorPos(1, y)
+            physical.blit(chars, foreground, background)
+            displayed[y] = {chars, foreground, background}
+        end
+    end
+end
+
+local splashStarted = os.clock()
+local nextScan = splashStarted + 1
 scan()
+while true do
+    local elapsed = os.clock() - splashStarted
+    showFleetStartup(elapsed / 4)
+    if elapsed >= 4 then break end
+    sleep(math.min(0.25, 4 - elapsed))
+    if os.clock() >= nextScan then
+        scan()
+        nextScan = os.clock() + 1
+    end
+end
 -- Do not silently apply a single-reactor configuration to an arbitrary port.
 
 local function textAt(screen, x, y, text, color)

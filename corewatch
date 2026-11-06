@@ -1,6 +1,11 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
+local COREWATCH_VERSION = "1.17.0"
+
+local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
+local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
+-- Corewatch | reactor control and telemetry for CC: Tweaked.
 -- Run corewatch to open the dashboard.
-local COREWATCH_VERSION = "1.16.4"
+
 
 local button = {}
 local filleds = {}
@@ -18,8 +23,8 @@ local showingModes = false
 local targetEntry
 local entryField
 local targetKeys = {}
-local controlMode = "AUTO"
-local bootMode = "AUTO"
+local controlMode = "MANUAL"
+local bootMode = "MANUAL"
 local choosingBootMode = false
 local standbyArmed = false
 local targetOutput = 500
@@ -37,7 +42,7 @@ local rfTotalMax = 10000000
 local minPowerRod = 0
 local maxPowerRod = 100
 
-local SETTINGS_FILE = "corewatch-settings.txt"
+local SETTINGS_FILE = settingsPath
 
 local reactors = {}
 local monitors = {}
@@ -62,9 +67,14 @@ local function newerVersion(candidate, installed)
 end
 
 local function checkForUpdate()
-	if updatePending or updateInstalled then return end
+	if updatePending or updateInstalled or not isVisible() then return end
+	if not reserveUpdate() then
+		updateStatus = "Another reactor is checking GitHub. Try again shortly."
+		return
+	end
 	downloadedUpdate = nil
 	if not http or not http.request then
+		reserveUpdate(true)
 		updateStatus = "HTTP is disabled on this server."
 		return
 	end
@@ -72,6 +82,7 @@ local function checkForUpdate()
 		url = UPDATE_URL, headers = {["Cache-Control"] = "no-cache"},
 	})
 	updatePending = ok and queued == true
+	if not updatePending then reserveUpdate(true) end
 	updateStatus = updatePending and "Checking GitHub..." or "Could not start the GitHub request."
 end
 
@@ -95,6 +106,10 @@ end
 
 local function installUpdate()
 	if not downloadedUpdate or updateInstalled then return end
+	if not installGate() then
+		updateStatus = "An update is installed. Reboot the CC computer."
+		return
+	end
 	local staged, backup = programPath .. ".download", programPath .. ".previous"
 	local ok, reason = pcall(function()
 		local file = assert(fs.open(staged, "w"))
@@ -117,12 +132,13 @@ local function installUpdate()
 		downloadedUpdate = nil
 		updateStatus = "Installed. Open the CC computer, then hold Ctrl+R."
 	else
+		installGate(true)
 		updateStatus = "Install failed. See the computer terminal."
 		print("[Corewatch] Update failed: " .. tostring(reason))
 	end
 end
 
-local SPLASH_DURATION = 4
+local SPLASH_DURATION = 0
 local VERSION
 local reactorTypes = {
 	{"BigReactors-Reactor", "BIG"},
@@ -131,22 +147,21 @@ local reactorTypes = {
 }
 
 local function discoverReactor()
-	for _, entry in ipairs(reactorTypes) do
-		local device = peripheral.find(entry[1])
-		if device then
-			local api = entry[2]
-			if api == "BIG" and device.mbIsConnected and device.mbIsAssembled then
-				api = "EXTREME"
-			end
-			if device.getEnergyStats then
-				local ok, energy = pcall(device.getEnergyStats)
-				if ok and energy.energyCapacity then rfTotalMax = energy.energyCapacity end
-			elseif api == "BIGGERv2" then
-				rfTotalMax = device.battery().capacity()
-			end
-			return device, api
-		end
-	end
+    local device = peripheral.wrap(portName)
+    if not device then return end
+    for _, entry in ipairs(reactorTypes) do
+        if peripheral.hasType(portName, entry[1]) then
+            local api = entry[2]
+            if api == "BIG" and device.mbIsConnected and device.mbIsAssembled then api = "EXTREME" end
+            if device.getEnergyStats then
+                local ok, energy = pcall(device.getEnergyStats)
+                if ok and energy.energyCapacity then rfTotalMax = energy.energyCapacity end
+            elseif api == "BIGGERv2" then
+                rfTotalMax = device.battery().capacity()
+            end
+            return device, api
+        end
+    end
 end
 local function applyCorewatchPalette(monitor)
 	monitor.setPaletteColor(colors.black, 0x101923)
@@ -190,7 +205,7 @@ end
 
 print("Corewatch v" .. COREWATCH_VERSION)
 
-monitors[1] = peripheral.find("monitor")
+monitors[1] = screen
 local startupMonitor = monitors[1]
 if not startupMonitor then
 	error("No monitor detected. Recommended: 4-wide by 3-tall Advanced Monitors. Attach the display directly or enable its wired modem.", 0)
@@ -238,7 +253,7 @@ local soundCues = {
 }
 
 local function playCue(name)
-	if not soundEnabled then return end
+	if not soundEnabled or not isVisible() then return end
 	local speaker = peripheral.find("speaker")
 	if speaker then
 		pcall(speaker.playNote, table.unpack(soundCues[name]))
@@ -583,7 +598,7 @@ local function showInfo(page)
 		row = row + 1
 	end
 
-	line("COREWATCH INFO  v" .. COREWATCH_VERSION .. "  " .. infoPage .. "/2", colors.cyan)
+	line("COREWATCH INFO  v" .. COREWATCH_VERSION .. "  " .. infoPage .. "/3", colors.cyan)
 	row = 5
 	local function section(title)
 		mon.setBackgroundColor(colors.gray)
@@ -600,11 +615,11 @@ local function showInfo(page)
 		line("  Blue sets MIN, where throttling begins.")
 		line("  Purple sets MAX, where rods reach 100% insertion.")
 		line("  Tap MIN or MAX to type a percentage.")
-		row = row + 1
+		row = row
 
 		line("MANUAL", colors.cyan)
 		line("  Holds the rods. Adjust with -10%, +10%, -1%, or +1%.")
-		row = row + 1
+		row = row
 
 		line("TARGET RF/t", colors.cyan)
 		line("  Tap the setpoint to type it. Blue buttons step by 50 RF/t.")
@@ -624,11 +639,11 @@ local function showInfo(page)
 
 		line("BOOT MODE", colors.cyan)
 		line("  Open MODE > BOOT MODE and choose a mode for future launches.")
-		line("  Auto is the default. Saving a choice leaves this run alone.")
+		line("  New reactors default to Manual. Set each boot mode separately.")
 		line("  Standby starts disarmed on reboot. Tap ARM to enable it.")
 		line("  Corewatch also remembers your Target RF/t setpoint.")
 
-	else
+	elseif infoPage == 2 then
 		section("OUTPUT & STORAGE")
 		line("OUTPUT: teal trace shows generation in RF/t, sampled every 2s.")
 		line("PEAK: highest output in view. The graph scales to that peak.")
@@ -654,11 +669,28 @@ local function showInfo(page)
 		line("Check the wired modem on the Reinforced Computer Port.")
 		line("After a lost link, tap ARM to re-arm Standby.")
 		line("Optional speaker: toggle sound from the MODE menu.")
+    else
+        section("MULTIPLE REACTORS")
+        line("Tap MACHINES in the top bar to select a reactor.")
+        line("Each reactor has its own settings, history, and session stats.")
+        line("Controllers continue running while another page is visible.")
+        line("New RF reactors start in Manual; choose their boot mode.")
+        row = row + 1
+        section("NAMES & CONNECTIONS")
+        line("RENAME: type the new name at the CC computer, then Enter.")
+        line("Saved assignments use the exact wired peripheral name.")
+        line("A lost port pauses that controller, not the other reactors.")
+        line("The top bar reports alerts even when viewing another reactor.")
+        row = row + 1
+        section("STEAM REACTORS & TURBINES")
+        line("Steam reactors have their own readings and manual controls.")
+        line("RF control modes do not regulate steam reactors.")
+        line("Turbine controls and dedicated monitor assignments come later.")
 
 	end
 
 	fill(colors.blue, {xmin = width - 16, xmax = width - 2, ymin = height - 3, ymax = height - 1,
-		title = infoPage == 1 and "NEXT >" or "< PREVIOUS"})
+		title = infoPage < 3 and "NEXT >" or "FIRST PAGE"})
 
 	fill(downloadedUpdate and colors.green or colors.blue, {xmin = width - 39, xmax = width - 25,
 		ymin = 1, ymax = 3, title = downloadedUpdate and "UPDATE READY" or "UPDATES"})
@@ -894,7 +926,7 @@ function clickEvent()
 		elseif event == "timer" and side == powerCheck then
 			powerCheck = nil
 			if not showingInfo and not showingModes and not targetEntry then draw() end
-		elseif event == "monitor_touch" and side == peripheral.getName(mon) then
+		elseif event == "monitor_touch" and side == screenName then
 			if targetEntry then
 				if handleTargetKey(x, y) then
 					targetEntry = nil
@@ -984,7 +1016,7 @@ function clickEvent()
 					end
 				elseif x >= width - 16 and x <= width - 2 and y >= height - 3 and y <= height - 1 then
 					playCue("tap")
-					showInfo(3 - infoPage)
+					showInfo(infoPage % 3 + 1)
 				elseif x >= width - 39 and x <= width - 25 and y <= 3 then
 					showUpdates()
 				elseif x >= width - 22 and x <= width - 13 and y <= 3 then
@@ -1063,6 +1095,9 @@ function adjustSelectedSetting(limit, number)
 end
 
 function adjustRodsLevel(sample)
+	if reactors[1].isActivelyCooled and reactors[1].isActivelyCooled() then
+		error("Cooling configuration changed", 0)
+	end
 	if controlMode == "MANUAL" then return end
 
 	local allStats = sample or readReactor()
@@ -1420,6 +1455,9 @@ function refreshDashboard()
 	if not reactorLinkReady() then
 		error(linkLost, 0)
 	end
+	if reactors[1].isActivelyCooled and reactors[1].isActivelyCooled() then
+		error("Cooling configuration changed", 0)
+	end
 	local stats = readReactor()
 	local bufferFraction = stats.rfTotal / rfTotalMax
 	bufferPercent = bufferFraction * 100
@@ -1429,6 +1467,7 @@ function refreshDashboard()
 	addNetFlow(stats.rfTotal, stats.rfPerTick)
 	adjustRodsLevel(stats)
 	stats.active = readPowerState()
+	report(stats.active and "RUNNING" or "OFF", stats.rfPerTick, fuelPercent, controlMode)
 	sampleSession(stats)
 	if showingInfo or showingModes or targetEntry then
 		if showingStats then showSessionStats() end
@@ -1528,7 +1567,7 @@ mon.clear()
 mon.setTextScale(0.5)
 
 loadSettings()
-if checkAtBoot then checkForUpdate() end
+if checkAtBoot and isVisible() then checkForUpdate() end
 playCue("ready")
 
 
@@ -1561,6 +1600,7 @@ while true do
 	clearTable()
 	resetDraw()
 	playCue("warning")
+	report("LINK LOST")
 	showStartup(mon, "REACTOR LINK LOST",
 		"Controls paused. Check the reactor and wired modem.",
 		"Waiting for the original port to return...")
@@ -1583,4 +1623,417 @@ while true do
 	fuelSamples = {}
 	playCue("ready")
 	mon.clear()
+end
+
+end
+
+-- Fleet supervisor: independent controller coroutines, one shared visible display.
+-- Turbines will plug into this registry when their controller is implemented.
+local nativeTerminal = term.current()
+local physical = peripheral.find("monitor")
+assert(physical, "No monitor detected. Recommended: 4-wide by 3-tall Advanced Monitors.")
+physical.setTextScale(0.5)
+for name, rgb in pairs({black = 0x101923, gray = 0x33485B, lightGray = 0xA5B9CB,
+    white = 0xEAF4FF, cyan = 0x70E5F4, lime = 0x47CFD2, blue = 0x235885,
+    lightBlue = 0x326A99, purple = 0x744E9B, green = 0x237E59,
+    red = 0xC54B5D, orange = 0xFFBC64}) do
+    physical.setPaletteColor(colors[name], rgb)
+end
+local width, height = physical.getSize()
+assert(width >= 70 and height >= 32, "Corewatch needs a larger display. Recommended: 4-wide by 3-tall Advanced Monitors at scale 0.5.")
+local displayName = peripheral.getName(physical)
+local REGISTRY_FILE = "corewatch-machines.txt"
+local registry = {schema = 1, machines = {}}
+if not fs.exists(REGISTRY_FILE) and fs.exists(REGISTRY_FILE .. ".previous") then
+    fs.move(REGISTRY_FILE .. ".previous", REGISTRY_FILE)
+end
+if fs.exists(REGISTRY_FILE) then
+    local file = assert(fs.open(REGISTRY_FILE, "r"))
+    local ok, saved = pcall(textutils.unserialize, file.readAll())
+    file.close()
+    assert(ok and type(saved) == "table" and saved.schema == 1 and type(saved.machines) == "table",
+        "Cannot read corewatch-machines.txt. Restore a backup before starting Corewatch.")
+    registry = saved
+end
+
+local records, byPort = {}, {}
+local selected = registry.selected
+local overview = true
+local page = 1
+local pendingName
+local updateOwner
+local updateInstalled = false
+local displayed = {}
+local migration = false
+local view = window.create(physical, 1, 1, width, height, false)
+view.setBackgroundColor(colors.black)
+local knownTypes = {"BigReactors-Reactor", "bigger-reactor", "BiggerReactors_Reactor"}
+
+local function saveRegistry()
+    registry.selected = selected
+    local path = REGISTRY_FILE .. ".new"
+    local file = assert(fs.open(path, "w"))
+    file.write(textutils.serialize(registry))
+    file.close()
+if fs.exists(REGISTRY_FILE) then
+        local previous = REGISTRY_FILE .. ".previous"
+        if fs.exists(previous) then fs.delete(previous) end
+        fs.move(REGISTRY_FILE, previous)
+    end
+    fs.move(path, REGISTRY_FILE)
+end
+
+local function settingsFor(port)
+    if registry.primary == port then return "corewatch-settings.txt" end
+    -- Hex encoding is reversible and cannot collide or create nested paths.
+    return "corewatch-reactor-" .. (port:gsub(".", function(c) return string.format("%02x", c:byte()) end)) .. ".txt"
+end
+
+local function classify(port)
+    local device = peripheral.wrap(port)
+    if not device then return nil, "LINK LOST" end
+    if device.mbIsAssembled then
+        local ok, assembled = pcall(device.mbIsAssembled)
+        if not ok or not assembled then return nil, "NOT ASSEMBLED" end
+    end
+    if device.isActivelyCooled then
+        local ok, steam = pcall(device.isActivelyCooled)
+        if not ok or type(steam) ~= "boolean" then return nil, "CHECK PORT" end
+        return steam and "STEAM" or "RF"
+    end
+    -- Legacy adapters retain their existing RF support.
+    return "RF"
+end
+
+local function scan()
+    local names = peripheral.getNames()
+    local listed = {}
+    for _, port in ipairs(names) do listed[port] = true end
+    for port in pairs(registry.machines) do
+        if not listed[port] then names[#names + 1] = port end
+    end
+    table.sort(names)
+    for _, port in ipairs(names) do
+        local supported = registry.machines[port] ~= nil
+        for _, kind in ipairs(knownTypes) do
+            if peripheral.hasType(port, kind) then supported = true; break end
+        end
+        if supported and not byPort[port] then
+            local saved = registry.machines[port]
+            if not saved then
+                saved = {name = "Reactor " .. (#records + 1)}
+                registry.machines[port] = saved
+            end
+            local frame = window.create(physical, 1, 3, width, height - 2, false)
+            -- Existing drawing code sees a monitor, while writes stay in memory.
+            frame.setTextScale = function() end
+            frame.isColor = physical.isColor
+            frame.isColour = physical.isColour or physical.isColor
+            local record = {port = port, name = saved.name, screen = frame, status = "CONNECTING"}
+            record.phase = (#records * 0.07) % 2
+            records[#records + 1], byPort[port] = record, record
+            if not selected then selected = port end
+        end
+    end
+    if not registry.primary then
+        migration = fs.exists("corewatch-settings.txt") and #records > 1
+        if #records == 1 or (#records > 0 and not migration) then
+            registry.primary = records[1].port
+            saveRegistry()
+        end
+    end
+end
+
+-- Keep the familiar four-second startup before any controller begins work.
+physical.setBackgroundColor(colors.black)
+physical.clear()
+physical.setTextColor(colors.cyan)
+physical.setCursorPos(math.max(1, math.floor(width / 2) - 7), math.floor(height / 2) - 1)
+physical.write("C O R E W A T C H")
+physical.setCursorPos(math.max(1, math.floor(width / 2) - 3), math.floor(height / 2) + 1)
+physical.write("v" .. COREWATCH_VERSION)
+sleep(4)
+scan()
+-- Do not silently apply a single-reactor configuration to an arbitrary port.
+
+local function textAt(screen, x, y, text, color)
+    screen.setCursorPos(x, y)
+    screen.setTextColor(color or colors.white)
+    local w = screen.getSize()
+    screen.write(tostring(text):sub(1, math.max(0, w - x + 1)))
+end
+
+local function runSteamController(record)
+    local screen = record.screen
+    local portName = record.port
+    local timer
+    local rods = {}
+    local function refresh()
+        local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
+        assert(not device.mbIsAssembled or device.mbIsAssembled(), "Steam reactor not assembled")
+        assert(device.isActivelyCooled(), "Cooling configuration changed")
+        local fuel = device.getFuelStats()
+        local steam = device.getHotFluidStats()
+        local coolant = device.getCoolantFluidStats()
+        rods = device.getControlRodsLevels()
+        local active = device.getActive()
+        record.status = active and "RUNNING" or "OFF"
+        record.output = steam.fluidProducedLastTick or 0
+        record.unit = "mB/t"
+        record.fuel = fuel.fuelCapacity > 0 and fuel.fuelAmount * 100 / fuel.fuelCapacity or 0
+        screen.setBackgroundColor(colors.black)
+        screen.clear()
+        textAt(screen, 3, 2, "COREWATCH  |  STEAM REACTOR  |  " .. record.status, active and colors.cyan or colors.red)
+        textAt(screen, 3, 4, "MANUAL CONTROL - automatic steam regulation is not available yet.", colors.orange)
+        textAt(screen, 3, 7, string.format("STEAM PRODUCTION   %.0f mB/t", record.output))
+        textAt(screen, 3, 10, string.format("STEAM STORED       %.0f / %.0f mB", steam.fluidAmount, steam.fluidCapacity))
+        textAt(screen, 3, 13, string.format("COOLANT STORED     %.0f / %.0f mB", coolant.fluidAmount, coolant.fluidCapacity))
+        textAt(screen, 3, 16, string.format("ROD INSERTION      %.0f%%", rods[0] or 0))
+        textAt(screen, 3, 18, string.format("FUEL %.1f%%   |   BURN %.3f mB/t   |   WASTE %.0f mB", record.fuel, fuel.fuelConsumedLastTick, fuel.wasteAmount))
+        textAt(screen, 3, 20, string.format("FUEL %.0f C   |   CASING %.0f C", fuel.fuelTemperature, device.getCasingTemperature()))
+        textAt(screen, 3, 23, "[ ON ]    [ OFF ]    RODS:  [ -10 ] [ -1 ] [ +1 ] [ +10 ]", colors.cyan)
+        textAt(screen, 3, 26, "No turbine is required to inspect this reactor.", colors.lightGray)
+        timer = os.startTimer(2)
+    end
+    refresh()
+    while true do
+        local event, side, x, y = os.pullEvent()
+        if event == "timer" and side == timer then refresh()
+        elseif event == "monitor_touch" and side == displayName and y == 23 then
+            local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
+            assert(device.isActivelyCooled(), "Cooling configuration changed")
+            if x >= 3 and x <= 8 then device.setActive(true)
+            elseif x >= 13 and x <= 19 then device.setActive(false)
+            else
+                local delta
+                if x >= 31 and x <= 37 then delta = -10
+                elseif x >= 39 and x <= 44 then delta = -1
+                elseif x >= 46 and x <= 51 then delta = 1
+                elseif x >= 53 and x <= 59 then delta = 10 end
+                if delta then
+                    -- Read current positions at the instant of the touch.
+                    local current = device.getControlRodsLevels()
+                    local requested = {}
+                    for index, level in pairs(current) do requested[index] = math.max(0, math.min(100, level + delta)) end
+                    device.setControlRodsLevels(requested)
+                end
+            end
+            refresh()
+        end
+    end
+end
+
+local function startWorker(record)
+    if migration then return end
+    local kind, status = classify(record.port)
+    if not kind then
+        record.status = status
+        record.output = nil
+        record.screen.setBackgroundColor(colors.black)
+        record.screen.clear()
+        textAt(record.screen, 3, 4, status, colors.red)
+        textAt(record.screen, 3, 7, "Check the reactor assembly, computer port, and wired modem.", colors.white)
+        textAt(record.screen, 3, 10, "Other reactors continue while this port is unavailable.", colors.lightGray)
+        return
+    end
+    record.kind = kind
+    record.unit = kind == "STEAM" and "mB/t" or "RF/t"
+    record.terminal = nativeTerminal
+    record.thread = coroutine.create(function()
+        if record.phase > 0 then sleep(record.phase) end
+        if kind == "STEAM" then return runSteamController(record) end
+        runRFController(record.port, record.screen, displayName, settingsFor(record.port),
+            function(state, output, fuel, mode)
+                record.status, record.output, record.fuel, record.mode = state, output, fuel, mode
+            end,
+            function() return selected == record.port end,
+            function(release)
+                if release then
+                    if updateOwner == record then updateOwner = nil end
+                    return true
+                end
+                if updateOwner and updateOwner ~= record then return false end
+                updateOwner = record
+                return true
+            end,
+            function(release)
+                if release then updateInstalled = false; return true end
+                if updateInstalled then return false end
+                updateInstalled = true
+                return true
+            end)
+    end)
+end
+
+local function resumeWorker(record, event)
+    if not record.thread then return end
+    term.redirect(record.terminal or nativeTerminal)
+    local ok, filter = coroutine.resume(record.thread, table.unpack(event, 1, event.n or #event))
+    record.terminal = term.current()
+    term.redirect(nativeTerminal)
+    if not ok or coroutine.status(record.thread) == "dead" then
+        record.thread = nil
+        record.status = "CONTROLLER PAUSED"
+        record.error = tostring(filter or "Controller stopped")
+        record.output = nil
+        if updateOwner == record then updateOwner = nil end
+        record.screen.setBackgroundColor(colors.black)
+        record.screen.clear()
+        textAt(record.screen, 3, 4, "CONTROLLER PAUSED", colors.red)
+        textAt(record.screen, 3, 7, record.error, colors.white)
+        textAt(record.screen, 3, 10, "Other reactors continue. Checking this port again shortly.", colors.lightGray)
+        print("[Corewatch] " .. record.port .. ": " .. record.error)
+    else record.filter = filter end
+end
+
+local function alerts()
+    local count = 0
+    for _, record in ipairs(records) do
+        if record.status == "LINK LOST" or record.status == "CONTROLLER PAUSED" or record.status == "NOT ASSEMBLED"
+            or (record.fuel and record.fuel < 5) then count = count + 1 end
+    end
+    return count
+end
+
+local function render()
+    term.redirect(nativeTerminal)
+    view.setBackgroundColor(colors.black)
+    view.clear()
+    local count = alerts()
+    textAt(view, 2, 1, overview and "COREWATCH  |  MACHINES" or "[ MACHINES ]", colors.cyan)
+    local record = byPort[selected]
+    if not overview and record then
+        textAt(view, 17, 1, record.name .. "  |  " .. (record.kind or "CHECKING"), colors.cyan)
+        textAt(view, width - 10, 1, "[ RENAME ]", colors.lightBlue)
+        textAt(view, 2, 2, record.port .. (count > 0 and ("  |  ALERTS: " .. count) or ""), count > 0 and colors.orange or colors.lightGray)
+        for y = 1, height - 2 do
+            local chars, fg, bg = record.screen.getLine(y)
+            view.setCursorPos(1, y + 2)
+            view.blit(chars, fg, bg)
+        end
+    else
+        local heading = migration and "Choose the ORIGINAL reactor to inherit your existing settings." or "Select a reactor. All registered controllers keep working."
+        textAt(view, 2, 3, heading, migration and colors.orange or colors.lightGray)
+        if pendingName then textAt(view, 2, 3, "Type a name at the CC computer, then press Enter: " .. pendingName, colors.cyan) end
+        local perPage = math.max(1, math.floor((height - 8) / 4))
+        local pages = math.max(1, math.ceil(#records / perPage))
+        page = math.max(1, math.min(page, pages))
+        for slot = 1, perPage do
+            local entry = records[(page - 1) * perPage + slot]
+            if entry then
+                local y = 5 + (slot - 1) * 4
+                textAt(view, 3, y, entry.name .. "  |  " .. (entry.kind or "CHECKING") .. "  |  " .. entry.status, colors.cyan)
+                textAt(view, 3, y + 1, entry.port, colors.lightGray)
+                if entry.output then
+                    textAt(view, 3, y + 2, string.format("%.0f %s%s", entry.output, entry.unit, entry.mode and ("  |  " .. entry.mode) or ""))
+                end
+            end
+        end
+        if #records == 0 then textAt(view, 3, 6, "No reactor ports found. Check the wired modems.", colors.orange) end
+        textAt(view, 3, height - 2, "[ PREV ]   " .. page .. "/" .. pages .. "   [ NEXT ]", colors.lightBlue)
+        textAt(view, 3, height, "Reactors: " .. #records .. "   Alerts: " .. count .. "   Turbine control: coming later", colors.lightGray)
+    end
+    for y = 1, height do
+        local chars, fg, bg = view.getLine(y)
+        local row = displayed[y]
+        if not row or row[1] ~= chars or row[2] ~= fg or row[3] ~= bg then
+            physical.setCursorPos(1, y)
+            physical.blit(chars, fg, bg)
+            displayed[y] = {chars, fg, bg}
+        end
+    end
+end
+
+local function launchPending()
+    for _, record in ipairs(records) do
+        if not record.thread then
+            startWorker(record)
+            if record.thread then resumeWorker(record, {n = 0}) end
+        end
+    end
+end
+
+-- Initialize once. Subsequent starts are staggered by the maintenance timer.
+launchPending()
+render()
+local maintenance = os.startTimer(2)
+while true do
+    local event = table.pack(os.pullEventRaw())
+    local name, side, x, y = table.unpack(event)
+    if name == "terminate" then
+        -- Deliver termination to every controller so none remains armed in memory.
+        for _, record in ipairs(records) do if record.thread then resumeWorker(record, event) end end
+        term.redirect(nativeTerminal)
+        error("Terminated", 0)
+    end
+    local consumed = false
+    if name == "monitor_resize" and side == displayName then
+        error("Monitor size changed. Reboot the CC computer to rebuild the display.", 0)
+    elseif name == "monitor_touch" and side == displayName then
+        if y <= 2 then
+            consumed = true
+            if x <= 14 then overview = true
+            elseif not overview and x >= width - 10 then
+                pendingName = ""
+                overview = true
+                print("[Corewatch] Type the new reactor name, then press Enter. Escape cancels.")
+            end
+        elseif overview then
+            consumed = true
+            local perPage = math.max(1, math.floor((height - 8) / 4))
+            if y >= height - 2 then
+                if x <= 11 then page = page - 1 else page = page + 1 end
+            elseif y >= 5 and y < 5 + perPage * 4 and not pendingName then
+                local index = (page - 1) * perPage + math.floor((y - 5) / 4) + 1
+                if records[index] then
+                    selected = records[index].port
+                    if migration then
+                        registry.primary = selected
+                        migration = false
+                        saveRegistry()
+                        launchPending()
+                    end
+                    overview = false
+                    saveRegistry()
+                end
+            end
+        end
+    elseif pendingName and name == "char" then
+        pendingName = (pendingName .. side):sub(1, 28)
+        consumed = true
+    elseif pendingName and name == "paste" then
+        pendingName = (pendingName .. side:gsub("[%c]", "")):sub(1, 28)
+        consumed = true
+    elseif pendingName and name == "key" then
+        consumed = true
+        if side == keys.backspace then pendingName = pendingName:sub(1, -2)
+        elseif side == keys.escape then pendingName = nil; overview = false
+        elseif side == keys.enter and pendingName:match("%S") then
+            local record = byPort[selected]
+            record.name = pendingName
+            registry.machines[selected].name = pendingName
+            pendingName = nil
+            overview = false
+            saveRegistry()
+        end
+    end
+    if name == "timer" and side == maintenance then
+        scan()
+        launchPending()
+        maintenance = os.startTimer(2)
+    end
+    local owner = updateOwner
+    if (name == "http_success" or name == "http_failure") and owner then updateOwner = nil end
+    for _, record in ipairs(records) do
+        local deliver = not consumed and (not record.filter or record.filter == name)
+        if name == "monitor_touch" then
+            deliver = deliver and side == displayName and not overview and selected == record.port
+        elseif name == "http_success" or name == "http_failure" then deliver = deliver and owner == record end
+        if deliver and record.thread then
+            local forwarded = event
+            if name == "monitor_touch" then forwarded = table.pack(name, side, x, y - 2) end
+            resumeWorker(record, forwarded)
+        end
+    end
+    render()
 end

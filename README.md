@@ -1,6 +1,6 @@
 # Corewatch
 
-Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Minecraft. See what your reactor is producing, what your base is drawing, and how much fuel you have left, all from one monitor wall.
+Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Minecraft. See what your reactor is producing, what your base is drawing, and how much fuel you have left, all from one monitor wall. Manage multiple reactors independently and switch between their dashboards.
 
 ![Corewatch dashboard showing power history, buffer, control rods, fuel, and waste](dashboard.png)
 
@@ -10,7 +10,9 @@ Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Mine
 - Tracks fuel, estimated runtime, fuel efficiency, and waste.
 - Compares energy, fuel burn, efficiency, and duty cycle across modes in **INFO → STATS**.
 - Saves your buffer limits, RF/t target, boot mode, and sound preference.
-- Reconnects when the reactor port returns and can check GitHub for updates.
+- Reconnects when each reactor port returns without stopping other controllers, and can check GitHub for updates.
+- Lists connected reactors under **MACHINES**, with separate settings, names, histories, and RF session statistics.
+- Detects steam reactors and provides steam/coolant readings plus manual power and rod controls.
 
 ## Control modes
 
@@ -24,11 +26,11 @@ Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Mine
 
 ![Corewatch mode menu with Auto, Manual, Target RF/t, Standby, and Load Match](mode-menu.png)
 
-Tap **MODE → BOOT MODE** to choose what opens after a reboot. Auto is the default. Standby boots disarmed. Tap **ARM** when you want it to manage starts. Tap the MIN and MAX values to enter them directly where those controls are available.
+Tap **MODE → BOOT MODE** to choose what opens after a reboot. New reactors default to Manual. Each reactor has its own saved boot mode. Standby boots disarmed. Tap **ARM** when you want it to manage starts. Tap the MIN and MAX values to enter them directly where those controls are available.
 
 ## Setup
 
-- **Reactor:** An Extreme Reactors reactor that generates RF directly, with a **Reinforced Reactor Computer Port**. Steam-producing reactors and turbines are future work.
+- **Reactors:** One or more Extreme Reactors reactors with **Reinforced Reactor Computer Ports**. Direct RF reactors retain all five control modes. Steam reactors currently have readings and manual controls; automatic steam regulation and turbine control are future work.
 - **Computer:** A CC: Tweaked computer connected directly to the reactor port or through a wired modem network. Enable peripheral access on the wired modem attached to the port.
 - **Display:** Advanced Monitors joined into a wall. **4 blocks wide by 3 blocks tall** is the recommended setup.
 - **Sound:** Optional CC: Tweaked Speaker, connected directly or over the wired network. Toggle cues under **MODE**.
@@ -44,11 +46,23 @@ wget https://github.com/TylzSomeone/corewatch/releases/latest/download/corewatch
 corewatch
 ```
 
-Corewatch creates `corewatch-settings.txt` on first run. To launch automatically, add this line to your CC computer's `startup` file.
+Corewatch keeps the original reactor's configuration in `corewatch-settings.txt`, stores other reactor configurations separately, and records names and assignments in `corewatch-machines.txt`. Back up these files together. To launch automatically, add this line to your CC computer's `startup` file.
 
 ```lua
 shell.run("corewatch")
 ```
+
+## Multiple reactors
+
+Tap **MACHINES** in the persistent top bar to select a reactor. All controllers continue working while you browse another dashboard or the paginated machine list. Alerts remain visible in the top bar. New ports are discovered automatically; saved missing ports remain listed for diagnosis.
+
+When upgrading an existing installation with several reactors connected, first select the **original reactor** to inherit your old settings. Controllers wait for that choice. Other RF reactors begin in **Manual** and retain their existing power state and rod positions until you change them. Configure each reactor's boot mode separately.
+
+Use **RENAME** on a reactor page, type a name at the CC computer, and press Enter. Escape cancels. Assignments are tied to exact peripheral names; check them after replacing or moving computer ports.
+
+Steam reactors show production, steam and coolant contents, fuel, waste, temperatures, and manual power/rod controls. Corewatch does not yet coordinate turbines or automatically regulate steam. Only one monitor wall is used in this version; dedicated displays are planned.
+
+There is no fixed reactor-count limit in the code. Automated simulations covered 40 reactors, but real-world capacity depends on the computer, modpack, and wired network. Each controller has a staggered refresh cycle and physical monitor writes are limited to changed rows.
 
 ## Updates
 
@@ -64,6 +78,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.17.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.0)** — Independent multi-reactor controllers, a shared monitor selector, names, per-reactor settings, connection isolation, and a manual steam-reactor page. Added a third INFO page and migration guidance.
 
 - **[v1.16.4](https://github.com/TylzSomeone/corewatch/releases/tag/v1.16.4)** — Added read-only fuel and casing temperatures for Extreme Reactors.
 

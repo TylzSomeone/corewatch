@@ -60,7 +60,7 @@ When upgrading an existing installation with several reactors connected, first s
 
 Use **RENAME** on a reactor page, type a name at the CC computer, and press Enter. Escape cancels. Assignments are tied to exact peripheral names; check them after replacing or moving computer ports.
 
-Steam reactors show production, steam and coolant contents, fuel, waste, temperatures, and manual power/rod controls. Corewatch does not yet coordinate turbines or automatically regulate steam. Only one monitor wall is used in this version; dedicated displays are planned.
+Steam reactors show a thin teal production-history trace in mB/t, percentage gauges for steam and coolant, a rod insertion bar, fuel, waste, temperatures, and full touch buttons for power and ±10%/±1% rod adjustments. The graph adds a sample every two seconds; button presses do not add samples. Empty tanks are labeled EMPTY. Corewatch does not yet coordinate turbines or automatically regulate steam. Only one monitor wall is used in this version; dedicated displays are planned.
 
 There is no fixed reactor-count limit in the code. Automated simulations covered 40 reactors, but real-world capacity depends on the computer, modpack, and wired network. Each controller has a staggered refresh cycle and physical monitor writes are limited to changed rows.
 
@@ -78,6 +78,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.17.1](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.1)** — Redesigned the steam-reactor dashboard with a thin teal history graph, steam/coolant gauges, a rod bar, and touch buttons. Updated INFO with steam graph and tank guidance.
 
 - **[v1.17.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.0)** — Independent multi-reactor controllers, a shared monitor selector, names, per-reactor settings, connection isolation, and a manual steam-reactor page. Added a third INFO page and migration guidance.
 

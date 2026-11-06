@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.17.0"
+local COREWATCH_VERSION = "1.17.1"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -684,6 +684,8 @@ local function showInfo(page)
         row = row + 1
         section("STEAM REACTORS & TURBINES")
         line("Steam reactors have their own readings and manual controls.")
+        line("Teal steam trace: production in mB/t, sampled every 2s.")
+        line("Tank gauges show steam and coolant amounts and percentages.")
         line("RF control modes do not regulate steam reactors.")
         line("Turbine controls and dedicated monitor assignments come later.")
 
@@ -1640,7 +1642,7 @@ for name, rgb in pairs({black = 0x101923, gray = 0x33485B, lightGray = 0xA5B9CB,
     physical.setPaletteColor(colors[name], rgb)
 end
 local width, height = physical.getSize()
-assert(width >= 70 and height >= 32, "Corewatch needs a larger display. Recommended: 4-wide by 3-tall Advanced Monitors at scale 0.5.")
+assert(width >= 79 and height >= 38, "Corewatch needs a larger display. Recommended: 4-wide by 3-tall Advanced Monitors at scale 0.5.")
 local displayName = peripheral.getName(physical)
 local REGISTRY_FILE = "corewatch-machines.txt"
 local registry = {schema = 1, machines = {}}
@@ -1767,15 +1769,96 @@ local function runSteamController(record)
     local screen = record.screen
     local portName = record.port
     local timer
-    local rods = {}
-    local function refresh()
+    local history, buttons = {}, {}
+    local w, h = screen.getSize()
+    local divider = math.floor(w * 2 / 3)
+    local lx, rx, right = 4, divider + 3, w - 3
+    local span = divider - lx - 2
+    local graphBottom = math.floor(h * 0.48)
+    local controlsBottom = math.floor(h * 0.63)
+    local function rect(x1, y1, x2, y2, color)
+        screen.setBackgroundColor(color)
+        for row = y1, y2 do
+            screen.setCursorPos(x1, row)
+            screen.write(string.rep(" ", x2 - x1 + 1))
+        end
+        screen.setBackgroundColor(colors.black)
+    end
+    local function number(value, precision)
+        local formatted = string.format("%." .. (precision or 0) .. "f", value or 0)
+        local whole, tail = formatted:match("^(%d+)(.*)$")
+        return whole and (whole:reverse():gsub("(%d%d%d)", "%1,"):gsub(",$", ""):reverse() .. tail) or formatted
+    end
+    local function frame(x1, y1, x2, y2, title, color)
+        rect(x1, y1, x2, y1, colors.gray)
+        rect(x1, y2, x2, y2, colors.gray)
+        rect(x1, y1, x1, y2, colors.gray)
+        rect(x2, y1, x2, y2, colors.gray)
+        textAt(screen, x1 + 2, y1, " " .. title .. " ", color or colors.cyan)
+    end
+    local function button(id, title, x1, y1, x2, y2, color, selected, change)
+        rect(x1, y1, x2, y2, color)
+        if selected then rect(x1, y1, x1, y2, colors.lime) end
+        screen.setBackgroundColor(color)
+        textAt(screen, math.floor((x1 + x2 - #title + 1) / 2), math.floor((y1 + y2) / 2), title)
+        screen.setBackgroundColor(colors.black)
+        buttons[#buttons + 1] = {id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2, change = change}
+    end
+    local function gauge(label, contents, capacity, row, color)
+        contents, capacity = contents or 0, capacity or 0
+        local fraction = capacity > 0 and math.max(0, math.min(1, contents / capacity)) or 0
+        local caption = label .. " " .. number(contents) .. " / " .. number(capacity) .. " mB"
+        caption = caption .. (capacity > 0 and (" (" .. number(fraction * 100, 1) .. "%)") or " (--)")
+        if contents == 0 then caption = caption .. " EMPTY" end
+        textAt(screen, lx, row, caption:sub(1, span))
+        rect(lx, row + 1, lx + span - 1, row + 3, colors.gray)
+        local filled = math.floor(span * fraction)
+        if filled > 0 then rect(lx, row + 1, lx + filled - 1, row + 3, color) end
+    end
+    local function graph(output, sample)
+        local pixelWidth = span * 2
+        local top, bottom = 6, graphBottom - 1
+        local pixelHeight = (bottom - top + 1) * 3
+        if sample then
+            history[#history + 1] = output
+            if #history > pixelWidth then table.remove(history, 1) end
+        end
+        local peak = 0
+        for _, value in ipairs(history) do peak = math.max(peak, value) end
+        textAt(screen, lx, 4, ("STEAM " .. number(output) .. " mB/t | PEAK " .. number(peak)):sub(1, span))
+        rect(lx, top, lx + span - 1, bottom, colors.gray)
+        local cells = {}
+        local function plot(px, py)
+            local cell = math.floor(py / 3) * span + math.floor(px / 2)
+            cells[cell] = bit32.bor(cells[cell] or 0, 2 ^ ((py % 3) * 2 + px % 2))
+        end
+        local previous
+        for i, value in ipairs(history) do
+            local px = pixelWidth - #history + i - 1
+            local py = pixelHeight - 1 - math.floor((pixelHeight - 1) * value / math.max(1, peak))
+            if previous then
+                local middle = math.floor((previous + py) / 2)
+                for row = math.min(previous, middle), math.max(previous, middle) do plot(px - 1, row) end
+                for row = math.min(middle, py), math.max(middle, py) do plot(px, row) end
+            else plot(px, py) end
+            previous = py
+        end
+        for cell, mask in pairs(cells) do
+            local inverse = mask >= 32
+            screen.setBackgroundColor(inverse and colors.lime or colors.gray)
+            textAt(screen, lx + cell % span, top + math.floor(cell / span),
+                string.char(128 + (inverse and 63 - mask or mask)), inverse and colors.gray or colors.lime)
+        end
+        screen.setBackgroundColor(colors.black)
+    end
+    local function refresh(sample)
         local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
         assert(not device.mbIsAssembled or device.mbIsAssembled(), "Steam reactor not assembled")
         assert(device.isActivelyCooled(), "Cooling configuration changed")
         local fuel = device.getFuelStats()
         local steam = device.getHotFluidStats()
         local coolant = device.getCoolantFluidStats()
-        rods = device.getControlRodsLevels()
+        local rods = device.getControlRodsLevels()
         local active = device.getActive()
         record.status = active and "RUNNING" or "OFF"
         record.output = steam.fluidProducedLastTick or 0
@@ -1783,33 +1866,58 @@ local function runSteamController(record)
         record.fuel = fuel.fuelCapacity > 0 and fuel.fuelAmount * 100 / fuel.fuelCapacity or 0
         screen.setBackgroundColor(colors.black)
         screen.clear()
-        textAt(screen, 3, 2, "COREWATCH  |  STEAM REACTOR  |  " .. record.status, active and colors.cyan or colors.red)
-        textAt(screen, 3, 4, "MANUAL CONTROL - automatic steam regulation is not available yet.", colors.orange)
-        textAt(screen, 3, 7, string.format("STEAM PRODUCTION   %.0f mB/t", record.output))
-        textAt(screen, 3, 10, string.format("STEAM STORED       %.0f / %.0f mB", steam.fluidAmount, steam.fluidCapacity))
-        textAt(screen, 3, 13, string.format("COOLANT STORED     %.0f / %.0f mB", coolant.fluidAmount, coolant.fluidCapacity))
-        textAt(screen, 3, 16, string.format("ROD INSERTION      %.0f%%", rods[0] or 0))
-        textAt(screen, 3, 18, string.format("FUEL %.1f%%   |   BURN %.3f mB/t   |   WASTE %.0f mB", record.fuel, fuel.fuelConsumedLastTick, fuel.wasteAmount))
-        textAt(screen, 3, 20, string.format("FUEL %.0f C   |   CASING %.0f C", fuel.fuelTemperature, device.getCasingTemperature()))
-        textAt(screen, 3, 23, "[ ON ]    [ OFF ]    RODS:  [ -10 ] [ -1 ] [ +1 ] [ +10 ]", colors.cyan)
-        textAt(screen, 3, 26, "No turbine is required to inspect this reactor.", colors.lightGray)
-        timer = os.startTimer(2)
+        frame(2, 2, divider, h - 1, "STEAM REACTOR")
+        frame(divider + 1, 2, w - 1, controlsBottom, active and "RUNNING" or "OFF", active and colors.cyan or colors.red)
+        frame(divider + 1, controlsBottom + 2, w - 1, h - 1, "FUEL & HEAT")
+        graph(record.output, sample)
+        gauge("STEAM", steam.fluidAmount, steam.fluidCapacity, graphBottom + 2, colors.lime)
+        gauge("COOLANT", coolant.fluidAmount, coolant.fluidCapacity, graphBottom + 7, colors.lightBlue)
+        local rodLevel = rods[0] or 0
+        textAt(screen, lx, h - 4, "ROD INSERTION " .. number(rodLevel) .. "%")
+        rect(lx, h - 3, lx + span - 1, h - 3, colors.gray)
+        local filled = math.floor(span * math.max(0, math.min(100, rodLevel)) / 100)
+        if filled > 0 then rect(lx, h - 3, lx + filled - 1, h - 3, colors.lime) end
+        buttons = {}
+        local middle = math.floor((rx + right) / 2)
+        button("ON", "ON", rx, 4, middle - 1, 6, colors.blue, active)
+        button("OFF", "OFF", middle + 1, 4, right, 6, colors.blue, not active)
+        textAt(screen, rx, 8, "MANUAL STEAM CONTROL", colors.cyan)
+        textAt(screen, rx, 9, "Auto regulation: later", colors.lightGray)
+        textAt(screen, rx, 11, "ROD INSERTION", colors.lightGray)
+        textAt(screen, rx, 12, number(rodLevel) .. "%")
+        button("RODS", "-10%", rx, 14, middle - 1, 16, colors.lightBlue, false, -10)
+        button("RODS", "-1%", middle + 1, 14, right, 16, colors.purple, false, -1)
+        button("RODS", "+10%", rx, 18, middle - 1, 20, colors.lightBlue, false, 10)
+        button("RODS", "+1%", middle + 1, 18, right, 20, colors.purple, false, 1)
+        local fuelRow = controlsBottom + 4
+        local fuelColor = record.fuel < 5 and colors.red or record.fuel < 15 and colors.orange or colors.white
+        textAt(screen, rx, fuelRow, "FUEL " .. number(record.fuel, 1) .. "%", fuelColor)
+        textAt(screen, rx, fuelRow + 2, number(fuel.fuelConsumedLastTick, 3) .. " mB/t")
+        local wasteColor = fuel.fuelCapacity > 0 and fuel.wasteAmount / fuel.fuelCapacity >= 0.25 and colors.orange or colors.white
+        textAt(screen, rx, fuelRow + 4, "WASTE " .. number(fuel.wasteAmount) .. " mB", wasteColor)
+        textAt(screen, rx, fuelRow + 6, "FUEL " .. number(fuel.fuelTemperature) .. " C", colors.lightGray)
+        textAt(screen, rx, fuelRow + 8, "CASING " .. number(device.getCasingTemperature()) .. " C", colors.lightGray)
     end
-    refresh()
+    refresh(true)
+    timer = os.startTimer(2)
     while true do
         local event, side, x, y = os.pullEvent()
-        if event == "timer" and side == timer then refresh()
-        elseif event == "monitor_touch" and side == displayName and y == 23 then
+        if event == "timer" and side == timer then
+            refresh(true)
+            timer = os.startTimer(2)
+        elseif event == "monitor_touch" and side == displayName then
+            local clicked
+            for _, candidate in ipairs(buttons) do
+                if x >= candidate.x1 and x <= candidate.x2 and y >= candidate.y1 and y <= candidate.y2 then clicked = candidate; break end
+            end
+            if clicked then
             local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
             assert(device.isActivelyCooled(), "Cooling configuration changed")
-            if x >= 3 and x <= 8 then device.setActive(true)
-            elseif x >= 13 and x <= 19 then device.setActive(false)
+            assert(not device.mbIsAssembled or device.mbIsAssembled(), "Steam reactor not assembled")
+            if clicked.id == "ON" then device.setActive(true)
+            elseif clicked.id == "OFF" then device.setActive(false)
             else
-                local delta
-                if x >= 31 and x <= 37 then delta = -10
-                elseif x >= 39 and x <= 44 then delta = -1
-                elseif x >= 46 and x <= 51 then delta = 1
-                elseif x >= 53 and x <= 59 then delta = 10 end
+                local delta = clicked.change
                 if delta then
                     -- Read current positions at the instant of the touch.
                     local current = device.getControlRodsLevels()
@@ -1818,7 +1926,8 @@ local function runSteamController(record)
                     device.setControlRodsLevels(requested)
                 end
             end
-            refresh()
+            refresh(false)
+            end
         end
     end
 end

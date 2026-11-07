@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.17.2"
+local COREWATCH_VERSION = "1.17.3"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -681,6 +681,7 @@ local function showInfo(page)
         line("Saved assignments use the exact wired peripheral name.")
         line("A lost port pauses that controller, not the other reactors.")
         line("The top bar reports alerts even when viewing another reactor.")
+        line("Tap ALERTS for the reactor, reason, and an OPEN REACTOR button.")
         row = row + 1
         section("STEAM REACTORS & TURBINES")
         line("Steam reactors have their own readings and manual controls.")
@@ -1663,6 +1664,10 @@ local selected = registry.selected
 local overview = true
 local page = 1
 local pendingName
+local showingAlerts = false
+local alertPage = 1
+local alertButton
+local renderedAlerts = {}
 local updateOwner
 local updateInstalled = false
 local displayed = {}
@@ -2003,6 +2008,10 @@ local function startWorker(record)
         if kind == "STEAM" then return runSteamController(record) end
         runRFController(record.port, record.screen, displayName, settingsFor(record.port),
             function(state, output, fuel, mode)
+                if state == "LINK LOST" then
+                    local _, reason = classify(record.port)
+                    state = reason or state
+                end
                 record.status, record.output, record.fuel, record.mode = state, output, fuel, mode
             end,
             function() return selected == record.port end,
@@ -2046,25 +2055,102 @@ local function resumeWorker(record, event)
 end
 
 local function alerts()
-    local count = 0
+    local entries = {}
     for _, record in ipairs(records) do
-        if record.status == "LINK LOST" or record.status == "CONTROLLER PAUSED" or record.status == "NOT ASSEMBLED"
-            or (record.fuel and record.fuel < 5) then count = count + 1 end
+        local issue, detail, hint
+        if record.status == "LINK LOST" then
+            issue = "REACTOR LINK LOST"
+            detail = "The saved reactor port is not reachable."
+            hint = "Check the cable and enable the port's wired modem."
+        elseif record.status == "NOT ASSEMBLED" then
+            issue = "REACTOR NOT ASSEMBLED"
+            detail = "The reactor reports an incomplete multiblock."
+            hint = "Check the reactor structure and its controller."
+        elseif record.status == "CONTROLLER PAUSED" then
+            issue = "CONTROLLER PAUSED"
+            detail = record.error or "The controller could not complete its last update."
+            hint = "Check this reactor and the error in the CC computer terminal."
+        elseif record.status == "CHECK PORT" then
+            issue = "PORT READ FAILED"
+            detail = "Corewatch could not read this reactor's cooling configuration."
+            hint = "Check the reactor assembly and computer port."
+        elseif record.fuel and record.fuel < 5 then
+            issue = record.fuel <= 0 and "NO FUEL" or string.format("LOW FUEL (%.1f%%)", record.fuel)
+            detail = record.fuel <= 0 and "The reactor's fuel supply is empty." or "Fuel is below the 5% alert threshold."
+            hint = "Add fuel through the reactor access port."
+        end
+        if issue then entries[#entries + 1] = {record = record, issue = issue, detail = detail, hint = hint} end
     end
-    return count
+    return entries
+end
+
+local function viewButton(label, x1, y1, x2, y2)
+    view.setBackgroundColor(colors.blue)
+    for row = y1, y2 do
+        view.setCursorPos(x1, row)
+        view.write(string.rep(" ", x2 - x1 + 1))
+    end
+    textAt(view, math.floor((x1 + x2 - #label + 1) / 2), math.floor((y1 + y2) / 2), label)
+    view.setBackgroundColor(colors.black)
+end
+
+local function renderAlertList(entries)
+    textAt(view, 3, 2, "COREWATCH | ALERTS  " .. #entries, colors.cyan)
+    viewButton("BACK", width - 12, 1, width - 2, 3)
+    textAt(view, 3, 4, "Affected reactors and current reasons. Controllers keep running.", colors.lightGray)
+    local perPage = math.max(1, math.floor((height - 8) / 8))
+    local pages = math.max(1, math.ceil(#entries / perPage))
+    alertPage = math.max(1, math.min(alertPage, pages))
+    renderedAlerts = {}
+    for slot = 1, perPage do
+        local entry = entries[(alertPage - 1) * perPage + slot]
+        if entry then
+            local row = 6 + (slot - 1) * 8
+            view.setBackgroundColor(colors.gray)
+            textAt(view, 3, row, string.rep(" ", width - 4))
+            textAt(view, 4, row, (entry.record.name .. " | " .. (entry.record.kind or "REACTOR")):sub(1, width - 7), colors.cyan)
+            view.setBackgroundColor(colors.black)
+            local textWidth = width - 24
+            textAt(view, 3, row + 1, entry.record.port:sub(1, textWidth), colors.lightGray)
+            textAt(view, 3, row + 2, entry.issue:sub(1, textWidth), colors.orange)
+            local remaining = tostring(entry.detail):gsub("%s+", " ")
+            for line = 1, 2 do
+                if #remaining == 0 then break end
+                local part = remaining:sub(1, textWidth)
+                if #remaining > textWidth then part = part:match("^(.*)%s") or part end
+                if line == 2 and #remaining > #part then part = part:sub(1, textWidth - 3) .. "..." end
+                textAt(view, 3, row + 2 + line, part)
+                remaining = remaining:sub(#part + 1):gsub("^%s+", "")
+            end
+            textAt(view, 3, row + 5, entry.hint:sub(1, width - 5), colors.lightGray)
+            viewButton("OPEN REACTOR", width - 18, row + 1, width - 3, row + 3)
+            renderedAlerts[#renderedAlerts + 1] = {record = entry.record, top = row + 1, bottom = row + 3}
+        end
+    end
+    if #entries == 0 then
+        textAt(view, 3, 8, "NO ACTIVE ALERTS", colors.lime)
+        textAt(view, 3, 10, "All monitored reactors are clear of the current alert conditions.", colors.lightGray)
+    end
+    viewButton("PREV", 3, height - 3, 13, height - 1)
+    textAt(view, math.floor(width / 2) - 3, height - 2, alertPage .. " / " .. pages, colors.lightGray)
+    viewButton("NEXT", width - 13, height - 3, width - 3, height - 1)
 end
 
 local function render()
     term.redirect(nativeTerminal)
     view.setBackgroundColor(colors.black)
     view.clear()
-    local count = alerts()
-    textAt(view, 2, 1, overview and "COREWATCH  |  MACHINES" or "[ MACHINES ]", colors.cyan)
+    local entries = alerts()
+    local count = #entries
+    alertButton = nil
+    if not showingAlerts then textAt(view, 2, 1, overview and "COREWATCH  |  MACHINES" or "[ MACHINES ]", colors.cyan) end
     local record = byPort[selected]
-    if not overview and record then
+    if showingAlerts then
+        renderAlertList(entries)
+    elseif not overview and record then
         textAt(view, 17, 1, record.name .. "  |  " .. (record.kind or "CHECKING"), colors.cyan)
         textAt(view, width - 10, 1, "[ RENAME ]", colors.lightBlue)
-        textAt(view, 2, 2, record.port .. (count > 0 and ("  |  ALERTS: " .. count) or ""), count > 0 and colors.orange or colors.lightGray)
+        textAt(view, 2, 2, record.port:sub(1, width - 23), colors.lightGray)
         for y = 1, height - 2 do
             local chars, fg, bg = record.screen.getLine(y)
             view.setCursorPos(1, y + 2)
@@ -2090,7 +2176,16 @@ local function render()
         end
         if #records == 0 then textAt(view, 3, 6, "No reactor ports found. Check the wired modems.", colors.orange) end
         textAt(view, 3, height - 2, "[ PREV ]   " .. page .. "/" .. pages .. "   [ NEXT ]", colors.lightBlue)
-        textAt(view, 3, height, "Reactors: " .. #records .. "   Alerts: " .. count .. "   Turbine control: coming later", colors.lightGray)
+        textAt(view, 3, height, "Reactors: " .. #records .. "   Turbine control: coming later", colors.lightGray)
+    end
+    if not showingAlerts then
+        local label = "[ ALERTS: " .. count .. " ]"
+        local row = overview and 1 or 2
+        local x = width - #label - 2
+        view.setBackgroundColor(colors.blue)
+        textAt(view, x, row, label, count > 0 and colors.orange or colors.lightGray)
+        view.setBackgroundColor(colors.black)
+        alertButton = {left = x, right = x + #label - 1, row = row}
     end
     for y = 1, height do
         local chars, fg, bg = view.getLine(y)
@@ -2129,7 +2224,28 @@ while true do
     if name == "monitor_resize" and side == displayName then
         error("Monitor size changed. Reboot the CC computer to rebuild the display.", 0)
     elseif name == "monitor_touch" and side == displayName then
-        if y <= 2 then
+        if showingAlerts then
+            consumed = true
+            if x >= width - 12 and y <= 3 then showingAlerts = false
+            elseif y >= height - 3 and y <= height - 1 then
+                if x >= 3 and x <= 13 then alertPage = alertPage - 1
+                elseif x >= width - 13 and x <= width - 3 then alertPage = alertPage + 1 end
+            elseif not migration and x >= width - 18 and x <= width - 3 then
+                for _, entry in ipairs(renderedAlerts) do
+                    if y >= entry.top and y <= entry.bottom then
+                        selected = entry.record.port
+                        overview = false
+                        showingAlerts = false
+                        saveRegistry()
+                        break
+                    end
+                end
+            end
+        elseif alertButton and y == alertButton.row and x >= alertButton.left and x <= alertButton.right and not pendingName then
+            consumed = true
+            showingAlerts = true
+            alertPage = 1
+        elseif y <= 2 then
             consumed = true
             if x <= 14 then overview = true
             elseif not overview and x >= width - 10 then
@@ -2186,7 +2302,7 @@ while true do
     for _, record in ipairs(records) do
         local deliver = not consumed and (not record.filter or record.filter == name)
         if name == "monitor_touch" then
-            deliver = deliver and side == displayName and not overview and selected == record.port
+            deliver = deliver and side == displayName and not overview and not showingAlerts and selected == record.port
         elseif name == "http_success" or name == "http_failure" then deliver = deliver and owner == record end
         if deliver and record.thread then
             local forwarded = event

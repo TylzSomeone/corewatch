@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.17.3"
+local COREWATCH_VERSION = "1.17.4"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -1153,10 +1153,19 @@ function adjustRodsLevel(sample)
 			if level < 100 then setRodInsertion(100, rodPositions) end
 		elseif estimatedExport ~= nil then
 			local output = allStats.rfPerTick
-			local reserveRate = fillPercent < minPowerRod and math.max(20, output * 0.05) or 0
+			-- Probe above observed output at EMPTY, including when MIN is zero.
+			local reserveRate = (fillPercent < minPowerRod or storedEnergy <= 0) and math.max(20, output * 0.05) or 0
 			local demand = estimatedExport + reserveRate
 			local errorRF = output - demand
-			if math.abs(errorRF) > math.max(10, demand * 0.03) then
+			local tolerance = math.max(10, demand * 0.03)
+			if reserveRate > 0 and netBufferRate ~= nil and netBufferRate < reserveRate then
+				-- At EMPTY, buffer drain is clipped to zero: estimated export is
+				-- only a lower bound on demand. A warm-up spike above its rolling
+				-- average must not close the rods while the reserve is not filling.
+				-- Withdraw gently until actual net flow supplies the reserve margin.
+				errorRF = math.min(errorRF, -math.max(tolerance + 1, reserveRate - netBufferRate))
+			end
+			if math.abs(errorRF) > tolerance then
 				-- Compare current generation with smoothed demand to reduce lag.
 				local rfPerRodPoint = math.max(5, output / math.max(1, 100 - level))
 				local step = math.max(1, math.min(8, math.floor(math.abs(errorRF) / rfPerRodPoint / 2)))

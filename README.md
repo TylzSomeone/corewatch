@@ -79,6 +79,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 
 ## Update log
 
+- **[v1.17.4](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.4)** — Fixed Load Match repeatedly closing the rods while the buffer is empty or below MIN and not filling fast enough. Reserve recovery now respects measured buffer flow instead of treating smoothed export as the full demand at EMPTY. MAX still caps fill; other modes retain their controls.
+
 - **[v1.17.3](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.3)** — Clickable alert counter and a paginated list of affected reactors, reasons, suggested checks, and OPEN REACTOR buttons. Resolved alerts clear automatically. Improved incomplete-assembly diagnostics.
 
 - **[v1.17.2](https://github.com/TylzSomeone/corewatch/releases/tag/v1.17.2)** — Restored the full startup splash with an animated progress bar, version, and connection/setup messages. It appears once per launch for at least four seconds, regardless of reactor count.

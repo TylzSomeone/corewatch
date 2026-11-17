@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.17.4"
+local COREWATCH_VERSION = "1.18.0"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -688,7 +688,9 @@ local function showInfo(page)
         line("Teal steam trace: production in mB/t, sampled every 2s.")
         line("Tank gauges show steam and coolant amounts and percentages.")
         line("RF control modes do not regulate steam reactors.")
-        line("Turbine controls and dedicated monitor assignments come later.")
+        line("MACHINES > MONITORS assigns the dedicated turbine screen.")
+        line("One spare monitor is assigned automatically; choices are saved.")
+        line("Turbines are discovered automatically; manual controls keep settings.")
 
 	end
 
@@ -1639,21 +1641,134 @@ end
 
 end
 
--- Fleet supervisor: independent controller coroutines, one shared visible display.
--- Turbines will plug into this registry when their controller is implemented.
-local nativeTerminal = term.current()
-local physical = peripheral.find("monitor")
-assert(physical, "No monitor detected. Recommended: 4-wide by 3-tall Advanced Monitors.")
-physical.setTextScale(0.5)
-for name, rgb in pairs({black = 0x101923, gray = 0x33485B, lightGray = 0xA5B9CB,
-    white = 0xEAF4FF, cyan = 0x70E5F4, lime = 0x47CFD2, blue = 0x235885,
-    lightBlue = 0x326A99, purple = 0x744E9B, green = 0x237E59,
-    red = 0xC54B5D, orange = 0xFFBC64}) do
-    physical.setPaletteColor(colors[name], rgb)
+-- Read-only sampling and explicit manual controls for Extreme Reactors turbines.
+-- Embedded by build-multireactor.py; installations still use a single file.
+local turbineUI = {}
+function turbineUI.read(record)
+    local device=assert(peripheral.wrap(record.port),"Turbine link lost")
+    if device.mbIsAssembled then assert(device.mbIsAssembled(),"Turbine not assembled") end
+    local function read(method,kind)
+        assert(type(device[method])=="function","Missing turbine method: "..method)
+        local value=device[method]()
+        assert(type(value)==kind,"Invalid turbine reading: "..method)
+        if kind=="number" then assert(value==value and value>=0 and value<math.huge,"Invalid turbine number") end
+        return value
+    end
+    local stats={active=read("getActive","boolean"),coils=read("getInductorEngaged","boolean"),
+        rpm=read("getRotorSpeed","number"),power=read("getEnergyProducedLastTick","number"),
+        stored=read("getEnergyStored","number"),capacity=read("getEnergyCapacity","number"),
+        steam=read("getInputAmount","number"),water=read("getOutputAmount","number"),
+        tank=read("getFluidAmountMax","number"),flow=read("getFluidFlowRate","number"),
+        limit=read("getFluidFlowRateMax","number"),maxFlow=read("getFluidFlowRateMaxMax","number"),
+        blades=read("getNumberOfBlades","number"),efficiency=read("getBladeEfficiency","number")}
+    record.stats,record.output,record.unit=stats,stats.power,"FE/t"
+    record.error=nil
+    record.status=stats.active and "RUNNING" or "OFF"
+    return stats,device
 end
-local width, height = physical.getSize()
-assert(width >= 79 and height >= 38, "Corewatch needs a larger display. Recommended: 4-wide by 3-tall Advanced Monitors at scale 0.5.")
-local displayName = peripheral.getName(physical)
+function turbineUI.sample(record)
+    local stats=turbineUI.read(record)
+    record.history=record.history or {}
+    record.history[#record.history+1]=stats.power
+    while #record.history>90 do table.remove(record.history,1) end
+end
+function turbineUI.control(record,action,value)
+    -- Re-read the exact selected port immediately before every manual write.
+    local stats,device=turbineUI.read(record)
+    if action=="on" or action=="off" then device.setActive(action=="on")
+    elseif action=="coils-on" or action=="coils-off" then device.setInductorEngaged(action=="coils-on")
+    elseif action=="flow" or action=="step" then
+        local flow=action=="step" and math.max(0,math.min(stats.maxFlow,stats.limit+value)) or value
+        assert(type(flow)=="number" and flow==math.floor(flow) and flow>=0 and flow<=stats.maxFlow,
+            "Flow must be a whole number from 0 to "..math.floor(stats.maxFlow))
+        device.setFluidFlowRateMax(flow)
+    else error("Unknown turbine control") end
+    turbineUI.read(record)
+    record.controlMessage="Manual setting applied"
+end
+function turbineUI.draw(record,screen,w,h)
+    local buttons={}
+    local function text(x,y,label,color,width)
+        width=math.min(width or w-x+1,w-x+1)
+        if y<1 or y>h or width<1 then return end
+        screen.setCursorPos(x,y);screen.setTextColor(color or colors.white)
+        screen.write(tostring(label):sub(1,width))
+    end
+    local function fmt(value)
+        if value>=1000000 then return string.format("%.2fM",value/1000000) end
+        if value>=1000 then return string.format("%.1fk",value/1000) end
+        return string.format("%.0f",value)
+    end
+    local function bar(y,value,maximum,color)
+        local length=w-4
+        local filled=maximum>0 and math.floor(length*math.min(1,value/maximum)) or 0
+        screen.setCursorPos(3,y);screen.setBackgroundColor(colors.gray);screen.write(string.rep(" ",length))
+        if filled>0 then screen.setCursorPos(3,y);screen.setBackgroundColor(color);screen.write(string.rep(" ",filled)) end
+        screen.setBackgroundColor(colors.black)
+    end
+    local function button(label,x,y,width,action,value,active)
+        screen.setBackgroundColor(active and colors.blue or colors.gray)
+        screen.setCursorPos(x,y);screen.write(string.rep(" ",width))
+        text(x+math.max(0,math.floor((width-#label)/2)),y,label,colors.white,width)
+        screen.setBackgroundColor(colors.black)
+        buttons[#buttons+1]={x=x,y=y,w=width,action=action,value=value}
+    end
+    screen.setBackgroundColor(colors.black);screen.clear()
+    if w<26 or h<20 then
+        text(2,2,"Turbine display too small",colors.orange)
+        text(2,4,"Expand monitor or use MACHINES.",colors.white)
+        return buttons
+    end
+    text(3,1,"COREWATCH | TURBINE",colors.cyan)
+    text(3,2,"MANUAL CONTROL | "..record.status,colors.lightGray)
+    local stats=record.stats
+    if not stats or record.status=="LINK LOST" or record.status=="NOT ASSEMBLED" or record.status=="CONTROLLER PAUSED" then
+        text(3,5,record.status,colors.orange)
+        text(3,7,record.error or "Check turbine port and wired modem.",colors.lightGray)
+        text(3,10,"Other machines keep running.",colors.lightGray)
+        return buttons
+    end
+    text(3,4,"ROTOR "..string.format("%.1f",stats.rpm).." RPM",colors.cyan)
+    bar(5,stats.rpm,2200,stats.rpm>2000 and colors.orange or colors.lime)
+    text(3,7,"OUTPUT "..fmt(stats.power).." FE/t",colors.white)
+    text(3,8,"STORED "..fmt(stats.stored).." / "..fmt(stats.capacity).." FE",colors.lightGray)
+    bar(9,stats.stored,stats.capacity,colors.cyan)
+    text(3,11,"STEAM "..fmt(stats.steam).." / "..fmt(stats.tank).." mB",colors.lightGray)
+    text(3,12,"WATER "..fmt(stats.water).." mB (shared tank)",colors.lightGray)
+    text(3,14,"FLOW "..fmt(stats.flow).." / "..fmt(stats.limit).." mB/t",colors.white)
+    text(3,15,"BLADES "..fmt(stats.blades).." | EFF "..string.format("%.0f%%",stats.efficiency),colors.lightGray)
+    if record.flowInput~=nil and record.controlMessage then text(3,16,record.controlMessage,colors.orange) end
+    local slot=math.floor((w-4)/4)
+    button("ON",3,17,slot,"on",nil,stats.active)
+    button("OFF",3+slot,17,slot,"off",nil,not stats.active)
+    button(slot>=9 and "COILS ON" or "COIL+",3+2*slot,17,slot,"coils-on",nil,stats.coils)
+    button(slot>=9 and "COILS OFF" or "COIL-",3+3*slot,17,w-2-(3+3*slot)+1,"coils-off",nil,not stats.coils)
+    slot=math.floor((w-4)/5)
+    button("-100",3,19,slot,"step",-100)
+    button("-10",3+slot,19,slot,"step",-10)
+    button("FLOW",3+2*slot,19,slot,"edit-flow")
+    button("+10",3+3*slot,19,slot,"step",10)
+    button("+100",3+4*slot,19,w-2-(3+4*slot)+1,"step",100)
+    if h>=25 then
+        text(3,21,"Steam limit: "..fmt(stats.maxFlow).." mB/t | OFF does not brake rotor.",colors.gray)
+        if h>=29 then
+            local top,bottom=23,h-3
+            local history=record.history or {}
+            local peak=1;for _,value in ipairs(history) do peak=math.max(peak,value) end
+            for x=1,math.min(w-4,#history) do
+                local value=history[#history-math.min(w-4,#history)+x]
+                local y=bottom-math.floor(value/peak*(bottom-top))
+                text(x+2,y,"*",colors.cyan)
+            end
+        end
+    end
+    text(3,h,record.flowInput~=nil and ("Type flow at computer: "..record.flowInput.." [Enter]")
+        or record.controlMessage or "Sampling only; steam reactor stays independent.",record.flowInput~=nil and colors.cyan or colors.gray)
+    return buttons
+end
+
+-- Fleet supervisor: automatic machine discovery and independent monitor roles.
+local nativeTerminal = term.current()
 local REGISTRY_FILE = "corewatch-machines.txt"
 local registry = {schema = 1, machines = {}}
 if not fs.exists(REGISTRY_FILE) and fs.exists(REGISTRY_FILE .. ".previous") then
@@ -1668,10 +1783,49 @@ if fs.exists(REGISTRY_FILE) then
     registry = saved
 end
 
+local function monitorNames()
+    local result={}
+    for _,name in ipairs(peripheral.getNames()) do if peripheral.hasType(name,"monitor") then result[#result+1]=name end end
+    table.sort(result);return result
+end
+local physical
+if registry.mainDisplay then physical=peripheral.wrap(registry.mainDisplay) end
+if not physical and registry.mainDisplay then
+    local candidate=peripheral.find("monitor")
+    if candidate and peripheral.getName(candidate)==registry.mainDisplay then physical=candidate end
+end
+if not physical and not registry.mainDisplay then
+    -- Keep the directly attached screen as the reactor console when present.
+    if peripheral.hasType("right","monitor") then physical=peripheral.wrap("right") end
+    if not physical then
+        for _,name in ipairs(monitorNames()) do
+            local candidate=peripheral.wrap(name)
+            local ok,w,h=pcall(function() candidate.setTextScale(0.5);return candidate.getSize() end)
+            if ok and w>=79 and h>=38 then physical=candidate;break end
+        end
+    end
+    if not physical then physical=peripheral.find("monitor") end
+end
+assert(physical, "No monitor detected. Recommended: 4-wide by 3-tall Advanced Monitors.")
+physical.setTextScale(0.5)
+for name, rgb in pairs({black = 0x101923, gray = 0x33485B, lightGray = 0xA5B9CB,
+    white = 0xEAF4FF, cyan = 0x70E5F4, lime = 0x47CFD2, blue = 0x235885,
+    lightBlue = 0x326A99, purple = 0x744E9B, green = 0x237E59,
+    red = 0xC54B5D, orange = 0xFFBC64}) do
+    physical.setPaletteColor(colors[name], rgb)
+end
+local width, height = physical.getSize()
+assert(width >= 79 and height >= 38, "Corewatch needs a larger display. Recommended: 4-wide by 3-tall Advanced Monitors at scale 0.5.")
+local displayName = peripheral.getName(physical)
+
 local records, byPort = {}, {}
 local selected = registry.selected
 local overview = true
 local page = 1
+local pendingFlow
+local displayMenu=false
+local displayChoices={}
+local auxiliary={displayed={},page=1,overview=false}
 local pendingName
 local showingAlerts = false
 local alertPage = 1
@@ -1684,9 +1838,11 @@ local migration = false
 local view = window.create(physical, 1, 1, width, height, false)
 view.setBackgroundColor(colors.black)
 local knownTypes = {"BigReactors-Reactor", "bigger-reactor", "BiggerReactors_Reactor"}
+local turbineTypes={"BigReactors-Turbine","extremereactor-turbineComputerPort"}
 
 local function saveRegistry()
     registry.selected = selected
+    registry.mainDisplay = displayName
     local path = REGISTRY_FILE .. ".new"
     local file = assert(fs.open(path, "w"))
     file.write(textutils.serialize(registry))
@@ -1712,6 +1868,8 @@ local function classify(port)
         local ok, assembled = pcall(device.mbIsAssembled)
         if not ok or not assembled then return nil, "NOT ASSEMBLED" end
     end
+    for _,kind in ipairs(turbineTypes) do if peripheral.hasType(port,kind) then return "TURBINE" end end
+    if registry.machines[port] and registry.machines[port].type=="TURBINE" then return "TURBINE" end
     if device.isActivelyCooled then
         local ok, steam = pcall(device.isActivelyCooled)
         if not ok or type(steam) ~= "boolean" then return nil, "CHECK PORT" end
@@ -1722,6 +1880,7 @@ local function classify(port)
 end
 
 local function scan()
+    local changed=false
     local names = peripheral.getNames()
     local listed = {}
     for _, port in ipairs(names) do listed[port] = true end
@@ -1734,30 +1893,37 @@ local function scan()
         for _, kind in ipairs(knownTypes) do
             if peripheral.hasType(port, kind) then supported = true; break end
         end
+        local turbine=(registry.machines[port] and registry.machines[port].type=="TURBINE") or false
+        for _,kind in ipairs(turbineTypes) do if peripheral.hasType(port,kind) then supported=true;turbine=true;break end end
         if supported and not byPort[port] then
             local saved = registry.machines[port]
             if not saved then
-                saved = {name = "Reactor " .. (#records + 1)}
+                local count=0
+                for _,record in ipairs(records) do if (record.machineType=="TURBINE")==turbine then count=count+1 end end
+                saved = {name = (turbine and "Turbine " or "Reactor ") .. (count + 1),type=turbine and "TURBINE" or "REACTOR"}
                 registry.machines[port] = saved
+                changed=true
             end
             local frame = window.create(physical, 1, 3, width, height - 2, false)
             -- Existing drawing code sees a monitor, while writes stay in memory.
             frame.setTextScale = function() end
             frame.isColor = physical.isColor
             frame.isColour = physical.isColour or physical.isColor
-            local record = {port = port, name = saved.name, screen = frame, status = "CONNECTING"}
+            local record = {port = port, name = saved.name, screen = frame, status = "CONNECTING",machineType=turbine and "TURBINE" or "REACTOR"}
             record.phase = (#records * 0.07) % 2
             records[#records + 1], byPort[port] = record, record
             if not selected then selected = port end
         end
     end
     if not registry.primary then
-        migration = fs.exists("corewatch-settings.txt") and #records > 1
-        if #records == 1 or (#records > 0 and not migration) then
-            registry.primary = records[1].port
-            saveRegistry()
+        local reactors={}
+        for _,record in ipairs(records) do if record.machineType~="TURBINE" then reactors[#reactors+1]=record end end
+        migration = fs.exists("corewatch-settings.txt") and #reactors > 1
+        if #reactors==1 or (#reactors>0 and not migration) then
+            registry.primary=reactors[1].port;saveRegistry()
         end
     end
+    if changed and registry.primary then saveRegistry() end
 end
 
 -- One shared splash for the whole installation, not one delay per reactor.
@@ -2014,6 +2180,17 @@ local function startWorker(record)
     record.terminal = nativeTerminal
     record.thread = coroutine.create(function()
         if record.phase > 0 then sleep(record.phase) end
+        if kind=="TURBINE" then
+            while true do
+                turbineUI.sample(record)
+                local timer=os.startTimer(2)
+                while true do
+                    local event,id=os.pullEventRaw()
+                    if event=="terminate" then error("Terminated",0) end
+                    if event=="timer" and id==timer then break end
+                end
+            end
+        end
         if kind == "STEAM" then return runSteamController(record) end
         runRFController(record.port, record.screen, displayName, settingsFor(record.port),
             function(state, output, fuel, mode)
@@ -2067,7 +2244,13 @@ local function alerts()
     local entries = {}
     for _, record in ipairs(records) do
         local issue, detail, hint
-        if record.status == "LINK LOST" then
+        if record.machineType=="TURBINE" then
+            if record.status=="LINK LOST" or record.status=="NOT ASSEMBLED" or record.status=="CONTROLLER PAUSED" then
+                issue="TURBINE "..record.status
+                detail=record.error or "Check the turbine assembly and wired modem."
+                hint="Other machines keep running. Open this turbine for details."
+            end
+        elseif record.status == "LINK LOST" then
             issue = "REACTOR LINK LOST"
             detail = "The saved reactor port is not reachable."
             hint = "Check the cable and enable the port's wired modem."
@@ -2145,6 +2328,97 @@ local function renderAlertList(entries)
     viewButton("NEXT", width - 13, height - 3, width - 3, height - 1)
 end
 
+local function updateAuxiliary()
+    displayChoices=monitorNames()
+    local spare={}
+    for _,name in ipairs(displayChoices) do if name~=displayName then spare[#spare+1]=name end end
+    if registry.turbineDisplay==nil and #spare==1 then registry.turbineDisplay=spare[1];saveRegistry() end
+    local name=registry.turbineDisplay
+    local device=type(name)=="string" and name~=displayName and peripheral.wrap(name) or nil
+    if not device then auxiliary.device=nil;return end
+    local ok,w,h=pcall(function() device.setTextScale(0.5);return device.getSize() end)
+    if not ok then auxiliary.device=nil;return end
+    if auxiliary.name~=name or auxiliary.w~=w or auxiliary.h~=h or not auxiliary.device then
+        auxiliary.name,auxiliary.w,auxiliary.h=name,w,h
+        auxiliary.frame=window.create(device,1,1,w,h,false)
+        auxiliary.child=window.create(auxiliary.frame,1,3,w,math.max(1,h-2),false)
+        auxiliary.displayed={}
+        for _,color in ipairs({colors.black,colors.gray,colors.lightGray,colors.white,colors.cyan,colors.lime,colors.blue,colors.lightBlue,colors.purple,colors.green,colors.red,colors.orange}) do
+            pcall(function() device.setPaletteColor(color,physical.getPaletteColor(color)) end)
+        end
+    end
+    auxiliary.device=device
+end
+local function handleTurbineTouch(record,buttons,x,y)
+    for _,button in ipairs(buttons or {}) do
+        if y==button.y and x>=button.x and x<button.x+button.w then
+            if button.action=="edit-flow" then
+                if pendingFlow then pendingFlow.flowInput=nil end
+                pendingFlow=record;record.flowInput="";record.controlMessage=nil
+                print("[Corewatch] Type the flow limit for "..record.name.." at the CC computer, then Enter. Escape cancels.")
+            else
+                local ok,reason=pcall(turbineUI.control,record,button.action,button.value)
+                if not ok then record.controlMessage="Control failed: "..tostring(reason) end
+            end
+            return true
+        end
+    end
+    return false
+end
+local function renderAuxiliary()
+    if not auxiliary.device then return end
+    local screen,w,h=auxiliary.frame,auxiliary.w,auxiliary.h
+    local function text(x,y,value,color)
+        if y<1 or y>h or x>w then return end
+        screen.setCursorPos(x,y);screen.setTextColor(color or colors.white);screen.write(tostring(value):sub(1,w-x+1))
+    end
+    screen.setBackgroundColor(colors.black);screen.clear()
+    auxiliary.entries={}
+    for _,record in ipairs(records) do if record.machineType=="TURBINE" then auxiliary.entries[#auxiliary.entries+1]=record end end
+    local selectedTurbine=byPort[registry.turbineSelected]
+    if not selectedTurbine or selectedTurbine.machineType~="TURBINE" then selectedTurbine=auxiliary.entries[1] end
+    auxiliary.selected=selectedTurbine
+    auxiliary.buttons={}
+    if w<26 or h<22 then
+        text(2,2,"Expand turbine monitor",colors.orange)
+        text(2,4,"Use 2x2 or larger at scale 0.5.",colors.lightGray)
+    elseif not selectedTurbine then
+        text(2,2,"COREWATCH | TURBINES",colors.cyan)
+        text(2,5,"Waiting for a turbine port.",colors.orange)
+        text(2,7,"Enable its wired modem.",colors.lightGray)
+    elseif auxiliary.overview then
+        text(2,1,"COREWATCH | TURBINES",colors.cyan)
+        text(2,3,"Tap a turbine to inspect it.",colors.lightGray)
+        local size=math.max(1,math.floor((h-6)/3))
+        local pages=math.max(1,math.ceil(#auxiliary.entries/size));auxiliary.page=math.max(1,math.min(pages,auxiliary.page))
+        for i=1,size do
+            local record=auxiliary.entries[(auxiliary.page-1)*size+i]
+            if record then
+                local y=5+(i-1)*3
+                text(2,y,record.name.." | "..record.status,colors.cyan)
+                text(2,y+1,record.port,colors.gray)
+            end
+        end
+        text(2,h,"< PREV   "..auxiliary.page.."/"..pages.."   NEXT >",colors.lightBlue)
+    else
+        -- Child window keeps the turbine renderer independent of monitor size.
+        local child=auxiliary.child
+        auxiliary.buttons=turbineUI.draw(selectedTurbine,child,w,h-2)
+        for y=1,h-2 do local chars,fg,bg=child.getLine(y);screen.setCursorPos(1,y+2);screen.blit(chars,fg,bg) end
+        text(2,1,"[ TURBINES ] "..selectedTurbine.name,colors.cyan)
+        text(2,2,selectedTurbine.port,colors.gray)
+    end
+    for y=1,h do
+        local chars,fg,bg=screen.getLine(y)
+        local old=auxiliary.displayed[y]
+        if not old or old[1]~=chars or old[2]~=fg or old[3]~=bg then
+            local ok=pcall(function() auxiliary.device.setCursorPos(1,y);auxiliary.device.blit(chars,fg,bg) end)
+            if not ok then auxiliary.device=nil;auxiliary.displayed={};return end
+            auxiliary.displayed[y]={chars,fg,bg}
+        end
+    end
+end
+
 local function render()
     term.redirect(nativeTerminal)
     view.setBackgroundColor(colors.black)
@@ -2154,9 +2428,21 @@ local function render()
     alertButton = nil
     if not showingAlerts then textAt(view, 2, 1, overview and "COREWATCH  |  MACHINES" or "[ MACHINES ]", colors.cyan) end
     local record = byPort[selected]
-    if showingAlerts then
+    if displayMenu then
+        textAt(view,3,2,"COREWATCH | MONITORS",colors.cyan)
+        textAt(view,3,4,"Reactor console: "..displayName,colors.lightGray)
+        textAt(view,3,6,"Turbine screen: "..tostring(registry.turbineDisplay or "not assigned"),colors.cyan)
+        textAt(view,3,8,"Tap a spare monitor below. Choices are saved automatically.",colors.lightGray)
+        local y=10
+        for _,name in ipairs(displayChoices) do
+            if name~=displayName and y<height-5 then textAt(view,4,y,"[ "..name.." ]",colors.lightBlue);y=y+2 end
+        end
+        textAt(view,4,height-4,"[ DISABLE TURBINE SCREEN ]",colors.lightBlue)
+        textAt(view,4,height-2,"[ BACK TO MACHINES ]",colors.lightBlue)
+    elseif showingAlerts then
         renderAlertList(entries)
     elseif not overview and record then
+        if record.kind=="TURBINE" then record.buttons=turbineUI.draw(record,record.screen,width,height-2) end
         textAt(view, 17, 1, record.name .. "  |  " .. (record.kind or "CHECKING"), colors.cyan)
         textAt(view, width - 10, 1, "[ RENAME ]", colors.lightBlue)
         textAt(view, 2, 2, record.port:sub(1, width - 23), colors.lightGray)
@@ -2166,7 +2452,7 @@ local function render()
             view.blit(chars, fg, bg)
         end
     else
-        local heading = migration and "Choose the ORIGINAL reactor to inherit your existing settings." or "Select a reactor. All registered controllers keep working."
+        local heading = migration and "Choose the ORIGINAL reactor to inherit your existing settings." or "Select a machine. All registered controllers keep working."
         textAt(view, 2, 3, heading, migration and colors.orange or colors.lightGray)
         if pendingName then textAt(view, 2, 3, "Type a name at the CC computer, then press Enter: " .. pendingName, colors.cyan) end
         local perPage = math.max(1, math.floor((height - 8) / 4))
@@ -2185,9 +2471,11 @@ local function render()
         end
         if #records == 0 then textAt(view, 3, 6, "No reactor ports found. Check the wired modems.", colors.orange) end
         textAt(view, 3, height - 2, "[ PREV ]   " .. page .. "/" .. pages .. "   [ NEXT ]", colors.lightBlue)
-        textAt(view, 3, height, "Reactors: " .. #records .. "   Turbine control: coming later", colors.lightGray)
+        local reactorCount,turbineCount=0,0
+        for _,entry in ipairs(records) do if entry.machineType=="TURBINE" then turbineCount=turbineCount+1 else reactorCount=reactorCount+1 end end
+        textAt(view, 3, height, "Reactors: "..reactorCount.." | Turbines: "..turbineCount.." | [ MONITORS ]", colors.lightGray)
     end
-    if not showingAlerts then
+    if not showingAlerts and not displayMenu then
         local label = "[ ALERTS: " .. count .. " ]"
         local row = overview and 1 or 2
         local x = width - #label - 2
@@ -2200,11 +2488,12 @@ local function render()
         local chars, fg, bg = view.getLine(y)
         local row = displayed[y]
         if not row or row[1] ~= chars or row[2] ~= fg or row[3] ~= bg then
-            physical.setCursorPos(1, y)
-            physical.blit(chars, fg, bg)
+            local ok=pcall(function() physical.setCursorPos(1,y);physical.blit(chars,fg,bg) end)
+            if not ok then displayed={};renderAuxiliary();return end
             displayed[y] = {chars, fg, bg}
         end
     end
+    renderAuxiliary()
 end
 
 local function launchPending()
@@ -2218,6 +2507,7 @@ end
 
 -- Initialize once. Subsequent starts are staggered by the maintenance timer.
 launchPending()
+updateAuxiliary()
 render()
 local maintenance = os.startTimer(2)
 while true do
@@ -2230,10 +2520,38 @@ while true do
         error("Terminated", 0)
     end
     local consumed = false
-    if name == "monitor_resize" and side == displayName then
+    if name=="monitor_touch" and side==registry.turbineDisplay and auxiliary.device then
+        consumed=true
+        if auxiliary.w>=26 and auxiliary.h>=22 then
+            if auxiliary.overview then
+                local size=math.max(1,math.floor((auxiliary.h-6)/3))
+                if y==auxiliary.h then auxiliary.page=auxiliary.page+(x<auxiliary.w/2 and -1 or 1)
+                elseif y>=5 and y<5+size*3 then
+                    local record=auxiliary.entries[(auxiliary.page-1)*size+math.floor((y-5)/3)+1]
+                    if record then registry.turbineSelected=record.port;auxiliary.overview=false;saveRegistry() end
+                end
+            elseif y<=2 then auxiliary.overview=true
+            elseif auxiliary.selected then handleTurbineTouch(auxiliary.selected,auxiliary.buttons,x,y-2) end
+        end
+    elseif name=="monitor_resize" and side==registry.turbineDisplay then
+        consumed=true;updateAuxiliary()
+    elseif name == "monitor_resize" and side == displayName then
         error("Monitor size changed. Reboot the CC computer to rebuild the display.", 0)
     elseif name == "monitor_touch" and side == displayName then
-        if showingAlerts then
+        if displayMenu then
+            consumed=true
+            if y>=height-2 then displayMenu=false;overview=true
+            elseif y>=height-4 then registry.turbineDisplay=false;saveRegistry();updateAuxiliary()
+            else
+                local row=10
+                for _,name in ipairs(displayChoices) do
+                    if name~=displayName and row<height-5 then
+                        if y==row then registry.turbineDisplay=name;saveRegistry();updateAuxiliary();break end
+                        row=row+2
+                    end
+                end
+            end
+        elseif showingAlerts then
             consumed = true
             if x >= width - 12 and y <= 3 then showingAlerts = false
             elseif y >= height - 3 and y <= height - 1 then
@@ -2265,11 +2583,12 @@ while true do
         elseif overview then
             consumed = true
             local perPage = math.max(1, math.floor((height - 8) / 4))
-            if y >= height - 2 then
+            if y==height then displayMenu=true;updateAuxiliary()
+            elseif y >= height - 2 then
                 if x <= 11 then page = page - 1 else page = page + 1 end
             elseif y >= 5 and y < 5 + perPage * 4 and not pendingName then
                 local index = (page - 1) * perPage + math.floor((y - 5) / 4) + 1
-                if records[index] then
+                if records[index] and (not migration or records[index].machineType~="TURBINE") then
                     selected = records[index].port
                     if migration then
                         registry.primary = selected
@@ -2281,6 +2600,23 @@ while true do
                     saveRegistry()
                 end
             end
+        elseif byPort[selected] and byPort[selected].kind=="TURBINE" then
+            consumed=true
+            handleTurbineTouch(byPort[selected],byPort[selected].buttons,x,y-2)
+        end
+    elseif pendingFlow and (name=="char" or name=="paste") then
+        consumed=true
+        local digits=tostring(side)
+        if digits:match("^%d+$") then pendingFlow.flowInput=(pendingFlow.flowInput..digits):sub(1,9) end
+    elseif pendingFlow and name=="key" then
+        consumed=true
+        if side==keys.escape then pendingFlow.flowInput=nil;pendingFlow=nil
+        elseif side==keys.backspace then pendingFlow.flowInput=pendingFlow.flowInput:sub(1,-2)
+        elseif side==keys.enter then
+            local record=pendingFlow
+            local ok,reason=pcall(turbineUI.control,record,"flow",tonumber(record.flowInput))
+            record.controlMessage=ok and "Manual flow limit applied" or tostring(reason)
+            if ok then record.flowInput=nil;pendingFlow=nil end
         end
     elseif pendingName and name == "char" then
         pendingName = (pendingName .. side):sub(1, 28)
@@ -2304,6 +2640,7 @@ while true do
     if name == "timer" and side == maintenance then
         scan()
         launchPending()
+        updateAuxiliary()
         maintenance = os.startTimer(2)
     end
     local owner = updateOwner

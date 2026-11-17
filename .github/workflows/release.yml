@@ -1,0 +1,33 @@
+name: Publish versioned Corewatch download
+on:
+  push:
+    branches: [main]
+    paths: [corewatch, RELEASE_NOTES.md, .github/workflows/release.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: corewatch-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Publish a new version once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^local COREWATCH_VERSION = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' corewatch)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving its download intact."
+            exit 0
+          fi
+          sha256sum corewatch
+          gh release create "$tag" corewatch --target "$GITHUB_SHA" \
+            --title "Corewatch $tag" --notes-file RELEASE_NOTES.md --latest

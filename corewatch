@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.18.0"
+local COREWATCH_VERSION = "1.19.0"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -690,7 +690,7 @@ local function showInfo(page)
         line("RF control modes do not regulate steam reactors.")
         line("MACHINES > MONITORS assigns the dedicated turbine screen.")
         line("One spare monitor is assigned automatically; choices are saved.")
-        line("Turbines are discovered automatically; manual controls keep settings.")
+        line("Turbines: Manual or 900/1800 RPM. RPM mode adjusts steam intake only.")
 
 	end
 
@@ -1641,9 +1641,14 @@ end
 
 end
 
--- Read-only sampling and explicit manual controls for Extreme Reactors turbines.
+-- Independent turbine telemetry, manual controls and opt-in RPM regulation.
 -- Embedded by build-multireactor.py; installations still use a single file.
 local turbineUI = {}
+function turbineUI.reset(record)
+    record.rpmTarget=nil
+    record.rpmControl=nil
+    record.rpmState=nil
+end
 function turbineUI.read(record)
     local device=assert(peripheral.wrap(record.port),"Turbine link lost")
     if device.mbIsAssembled then assert(device.mbIsAssembled(),"Turbine not assembled") end
@@ -1666,8 +1671,62 @@ function turbineUI.read(record)
     record.status=stats.active and "RUNNING" or "OFF"
     return stats,device
 end
+function turbineUI.regulate(record,stats,device)
+    if not record.rpmTarget then return end
+    local at=os.clock()
+    local state=record.rpmControl or {lastRPM=stats.rpm,lastAt=at,fraction=0,rate=0}
+    record.rpmControl=state
+    local elapsed=at-state.lastAt
+    local previousRPM=state.lastRPM
+    state.lastRPM,state.lastAt=stats.rpm,at
+    if not stats.active or not stats.coils then
+        state.rate,state.fraction=0,0
+        record.rpmState=not stats.active and "Waiting: turbine OFF" or "Waiting: coils OFF"
+        return
+    end
+    if elapsed<1 or elapsed>10 then
+        state.rate,state.fraction=0,0
+        record.rpmState="Collecting RPM trend"
+        return
+    end
+    state.rate=0.5*state.rate+0.5*(stats.rpm-previousRPM)/elapsed
+    local errorRPM=record.rpmTarget-stats.rpm
+    if math.abs(errorRPM)<=8 and math.abs(state.rate)<0.25 then
+        state.fraction=0;record.rpmState="Holding target";return
+    end
+    -- A long look-ahead avoids chasing the current RPM while a heavy rotor
+    -- is still accelerating. Commands remain bounded to 1% of max flow, <=25.
+    local predicted=stats.rpm+state.rate*90
+    local flowPerRPM=math.max(stats.limit,20)/math.max(stats.rpm,record.rpmTarget*0.25)
+    local maximumStep=math.max(1,math.min(25,math.floor(stats.maxFlow*0.01)))
+    local correction=(record.rpmTarget-predicted)*flowPerRPM*0.1
+    correction=math.max(-maximumStep,math.min(maximumStep,correction))
+    if errorRPM>8 and correction>=0 then
+        if stats.tank>0 and stats.water>=stats.tank-1 then
+            state.fraction=0;record.rpmState="Condensate output blocked";return
+        elseif stats.limit>1 and stats.flow+1<stats.limit*0.9 and stats.steam<=math.max(1,stats.flow) then
+            state.fraction=0;record.rpmState="Steam supply limited";return
+        elseif stats.limit>=stats.maxFlow then
+            state.fraction=0;record.rpmState="At maximum steam flow";return
+        end
+    end
+    -- Preserve sub-unit changes until a whole mB/t adjustment is warranted.
+    state.fraction=state.fraction+correction
+    local change=state.fraction>=0 and math.floor(state.fraction) or math.ceil(state.fraction)
+    state.fraction=state.fraction-change
+    local flow=math.max(0,math.min(math.floor(stats.maxFlow),stats.limit+change))
+    record.rpmState=correction<0 and "Easing steam flow" or "Building speed gently"
+    if flow==stats.limit then
+        if flow==0 or flow==stats.maxFlow then state.fraction=0 end
+        return
+    end
+    assert(type(device.setFluidFlowRateMax)=="function","Missing turbine flow control")
+    device.setFluidFlowRateMax(flow)
+    stats.limit=flow
+end
 function turbineUI.sample(record)
-    local stats=turbineUI.read(record)
+    local stats,device=turbineUI.read(record)
+    turbineUI.regulate(record,stats,device)
     record.history=record.history or {}
     record.history[#record.history+1]=stats.power
     while #record.history>90 do table.remove(record.history,1) end
@@ -1675,13 +1734,27 @@ end
 function turbineUI.control(record,action,value)
     -- Re-read the exact selected port immediately before every manual write.
     local stats,device=turbineUI.read(record)
-    if action=="on" or action=="off" then device.setActive(action=="on")
-    elseif action=="coils-on" or action=="coils-off" then device.setInductorEngaged(action=="coils-on")
+    if action=="manual" then
+        turbineUI.reset(record)
+        record.controlMessage="Manual: current flow retained";return
+    elseif action=="rpm" then
+        assert(value==900 or value==1800,"Choose 900 or 1800 RPM")
+        record.rpmTarget=value
+        record.rpmControl={lastRPM=stats.rpm,lastAt=os.clock(),fraction=0,rate=0}
+        record.rpmState="Selected; waiting for next sample"
+        record.controlMessage="RPM mode adjusts only steam flow";return
+    elseif action=="on" or action=="off" then
+        device.setActive(action=="on")
+        if action=="off" then turbineUI.reset(record) end
+    elseif action=="coils-on" or action=="coils-off" then
+        device.setInductorEngaged(action=="coils-on")
+        if action=="coils-off" then turbineUI.reset(record) end
     elseif action=="flow" or action=="step" then
         local flow=action=="step" and math.max(0,math.min(stats.maxFlow,stats.limit+value)) or value
         assert(type(flow)=="number" and flow==math.floor(flow) and flow>=0 and flow<=stats.maxFlow,
             "Flow must be a whole number from 0 to "..math.floor(stats.maxFlow))
         device.setFluidFlowRateMax(flow)
+        turbineUI.reset(record)
     else error("Unknown turbine control") end
     turbineUI.read(record)
     record.controlMessage="Manual setting applied"
@@ -1720,7 +1793,6 @@ function turbineUI.draw(record,screen,w,h)
         return buttons
     end
     text(3,1,"COREWATCH | TURBINE",colors.cyan)
-    text(3,2,"MANUAL CONTROL | "..record.status,colors.lightGray)
     local stats=record.stats
     if not stats or record.status=="LINK LOST" or record.status=="NOT ASSEMBLED" or record.status=="CONTROLLER PAUSED" then
         text(3,5,record.status,colors.orange)
@@ -1728,8 +1800,14 @@ function turbineUI.draw(record,screen,w,h)
         text(3,10,"Other machines keep running.",colors.lightGray)
         return buttons
     end
+    local modeWidth=math.floor((w-4)/3)
+    button("MANUAL",3,2,modeWidth,"manual",nil,not record.rpmTarget)
+    button("900 RPM",3+modeWidth,2,modeWidth,"rpm",900,record.rpmTarget==900)
+    button("1800 RPM",3+2*modeWidth,2,w-4-2*modeWidth,"rpm",1800,record.rpmTarget==1800)
     text(3,4,"ROTOR "..string.format("%.1f",stats.rpm).." RPM",colors.cyan)
     bar(5,stats.rpm,2200,stats.rpm>2000 and colors.orange or colors.lime)
+    text(3,6,record.rpmTarget and (record.rpmTarget.." RPM | "..(record.rpmState or "Waiting"))
+        or ("MANUAL | "..record.status),colors.lightGray)
     text(3,7,"OUTPUT "..fmt(stats.power).." FE/t",colors.white)
     text(3,8,"STORED "..fmt(stats.stored).." / "..fmt(stats.capacity).." FE",colors.lightGray)
     bar(9,stats.stored,stats.capacity,colors.cyan)
@@ -1763,7 +1841,7 @@ function turbineUI.draw(record,screen,w,h)
         end
     end
     text(3,h,record.flowInput~=nil and ("Type flow at computer: "..record.flowInput.." [Enter]")
-        or record.controlMessage or "Sampling only; steam reactor stays independent.",record.flowInput~=nil and colors.cyan or colors.gray)
+        or record.controlMessage or "Steam reactor stays independent.",record.flowInput~=nil and colors.cyan or colors.gray)
     return buttons
 end
 
@@ -2226,6 +2304,7 @@ local function resumeWorker(record, event)
     record.terminal = term.current()
     term.redirect(nativeTerminal)
     if not ok or coroutine.status(record.thread) == "dead" then
+        if record.machineType=="TURBINE" then turbineUI.reset(record) end
         record.thread = nil
         record.status = "CONTROLLER PAUSED"
         record.error = tostring(filter or "Controller stopped")

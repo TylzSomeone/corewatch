@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.20.0"
+local COREWATCH_VERSION = "1.20.1"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -1764,9 +1764,17 @@ function turbineUI.control(record,action,value)
         record.controlMessage="Manual: current flow retained";return
     elseif action=="rpm" then
         assert(value==900 or value==1800,"Choose 900 or 1800 RPM")
-        assert(not record.profileStale,"Turbine changed: recalibrate before using RPM mode")
+        if turbineUI.beginCalibration and not turbineUI.profileFor(record,value) then
+            local point=not record.profileStale and record.calibration and record.calibration.points and record.calibration.points[tostring(value)]
+            assert(not point or point.status~="unreachable","Calibration could not reach this RPM at maximum flow")
+            turbineUI.beginCalibration(record,stats,device,value)
+            record.calibrationPage=true
+            record.controlMessage="Calibrating before running "..value.." RPM"
+            return
+        end
         local point=record.calibration and record.calibration.points and record.calibration.points[tostring(value)]
         assert(not point or point.status~="unreachable","Calibration could not reach this RPM at maximum flow")
+        if turbineUI.beginCalibration and not stats.active then device.setActive(true);stats.active=true end
         record.rpmTarget=value
         record.rpmControl={lastRPM=stats.rpm,lastAt=os.clock(),fraction=0,rate=0,initial=true}
         record.rpmState="Selected; waiting for next sample"
@@ -1926,6 +1934,8 @@ do
         -- The marker stays durable until both idempotent writes have succeeded.
         setFlow(device,stats,pending.flow)
         setCoils(device,stats,pending.coils)
+        -- Recovery may turn off a turbine started by the test, but never powers one on.
+        if pending.active==false and stats.active then device.setActive(false);stats.active=false end
         commit(record,record.calibration,nil)
         record.controlMessage="Previous settings restored; Manual"
     end
@@ -1933,7 +1943,7 @@ do
         run.phase,run.phaseAt,run.phaseRPM=name,os.clock(),stats.rpm
         run.flowTotal,run.flowSamples=0,0
     end
-    local function finish(record,stats,device,message)
+    local function finish(record,stats,device,message,completed)
         local run=record.calibrationRun
         if run then
             local profile
@@ -1947,6 +1957,11 @@ do
         turbineUI.restore(record,stats,device)
         record.calibrationMessage=message
         turbineUI.checkProfile(record,stats)
+        if completed and run and run.requestedRPM and turbineUI.profileFor(record,run.requestedRPM) then
+            turbineUI.control(record,"rpm",run.requestedRPM)
+            record.calibrationPage=false
+            record.calibrationMessage="Calibration saved; running "..run.requestedRPM.." RPM"
+        end
     end
     function turbineUI.cancelCalibration(record,stats,device)
         if not record.calibrationRun and not record.restorePending then return end
@@ -1955,20 +1970,20 @@ do
         turbineUI.restore(record,stats,device)
         record.calibrationMessage="Test cancelled; previous settings restored"
     end
-    function turbineUI.beginCalibration(record,stats,device)
+    function turbineUI.beginCalibration(record,stats,device,requestedRPM)
         assert(not record.calibrationRun,"Calibration is already running")
-        assert(stats.active,"Turn the turbine ON before starting calibration")
         assert(stats.blades>0 and stats.mass>0 and stats.maxFlow>=1,"A complete rotor and rotor-mass readings are required")
         assert(stats.steam>0 or stats.flow>0,"Supply steam before starting calibration")
         assert(stats.tank>0 and stats.water<stats.tank-1,"Clear the condensate output before calibration")
         if record.restorePending then turbineUI.reset(record);turbineUI.restore(record,stats,device) end
-        local pending={flow=stats.limit,coils=stats.coils}
+        local pending={flow=stats.limit,coils=stats.coils,active=stats.active}
         -- Store restoration BEFORE the first change, including across a reboot.
         commit(record,record.calibration,pending)
         turbineUI.reset(record)
-        local run={signature=signature(stats),points={},response={},started=os.clock(),
+        local run={signature=signature(stats),points={},response={},started=os.clock(),requestedRPM=requestedRPM,
             probeFlow=math.max(1,math.min(stats.maxFlow,math.max(10,math.floor(stats.maxFlow*0.1))))}
         record.calibrationRun=run;record.calibrationMessage=nil;record.profileSuspect=nil
+        if not stats.active then device.setActive(true);stats.active=true end
         if stats.rpm>1200 then
             startPhase(run,"prepare",stats);setCoils(device,stats,true);setFlow(device,stats,0)
         else startPhase(run,"coast",stats);setFlow(device,stats,0);setCoils(device,stats,false) end
@@ -1992,7 +2007,7 @@ do
         if not sameSignature(run.signature,stats) then finish(record,stats,device,"Turbine changed during test; recalibrate");return end
         if not stats.active then finish(record,stats,device,"Test stopped: turbine was turned OFF");return end
         if stats.rpm>2050 then
-            commit(record,record.calibration,{flow=0,coils=true})
+            commit(record,record.calibration,{flow=0,coils=true,active=record.restorePending and record.restorePending.active})
             finish(record,stats,device,"RPM too high: test stopped, flow zero, coils ON");return
         end
         if at-run.started>4200 then finish(record,stats,device,"Test timed out; no unmeasured target was saved");return end
@@ -2047,7 +2062,7 @@ do
                     run.points[tostring(run.target)]={status="ready",flow=math.max(1,math.floor(run.stableFlow/run.stableSamples+0.5)),
                         rpm=run.stableRPM/run.stableSamples,power=stats.power}
                     if run.target==900 then beginTarget(record,run,stats,device,1800)
-                    else finish(record,stats,device,"Calibration saved; original settings restored") end
+                    else finish(record,stats,device,"Calibration saved; original settings restored",true) end
                     return
                 end
             else run.stableAt,run.stableFlow,run.stableRPM,run.stableSamples=nil,0,0,0 end
@@ -2162,10 +2177,10 @@ do
             text(3,8,"Tests acceleration, braking, then",colors.lightGray)
             text(3,9,"steady flow at 900 and 1800 RPM.",colors.lightGray)
             text(3,11,"Changes steam flow and coil engagement.",colors.orange)
-            text(3,12,"Turbine must be ON; steam supplied",colors.lightGray)
+            text(3,12,"Starts turbine; keep steam supplied",colors.lightGray)
             text(3,13,"and condensate able to leave.",colors.lightGray)
             text(3,15,"May take several minutes. Cancel restores",colors.gray)
-            text(3,16,"previous flow and coils. Reactor untouched.",colors.gray)
+            text(3,16,"previous settings. Reactor untouched.",colors.gray)
         end
         local half=math.floor((w-4)/2)
         button(record.calibrationRun and "CANCEL TEST" or "START TEST",3,h-3,half,record.calibrationRun and "cancel-calibration" or "start-calibration")

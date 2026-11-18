@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.20.3"
+local COREWATCH_VERSION = "1.20.4"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -1908,6 +1908,10 @@ do
     local function setCoils(device,stats,engaged)
         if stats.coils~=engaged then device.setInductorEngaged(engaged);stats.coils=engaged end
     end
+    local function coilEngagementRPM(target,rate)
+        -- Use the same close approach for calibration and saved-profile startup.
+        return target-math.max(5,math.min(target*0.015,math.max(0,rate)*2))
+    end
     function turbineUI.checkProfile(record,stats)
         local profile=record.calibration
         record.profileStale=profile~=nil and (type(profile)~="table" or profile.schema~=1
@@ -2063,7 +2067,7 @@ do
                 run.approachAt,run.approachRPM=at,stats.rpm
                 -- Coil load acts immediately: a long braking lead leaves a slow
                 -- rotor far below target. Limit this handoff to the final 1.5%.
-                local engageAt=run.target-math.max(5,math.min(run.target*0.015,math.max(0,rate)*2))
+                local engageAt=coilEngagementRPM(run.target,rate)
                 if stats.rpm>=engageAt then
                     run.approaching=false
                     setCoils(device,stats,true);setFlow(device,stats,run.loadedFlow)
@@ -2149,7 +2153,7 @@ do
         end
         if state.initial then
             state.initial=false
-            if stats.rpm<target*0.8 and stats.steam>0 then
+            if stats.rpm<target*0.985 and stats.steam>0 then
                 -- A crash during unloaded spin-up restores this known loaded
                 -- operating point. It never turns turbine power on.
                 commit(record,record.calibration,{flow=point.flow,coils=true})
@@ -2161,9 +2165,7 @@ do
             end
         end
         if state.phase=="spinup" then
-            local response=record.calibration.response or {}
-            local lead=response.engageSeconds or 6
-            if stats.rpm+math.max(0,state.rate)*lead>=target-math.max(10,target*0.02) then
+            if stats.rpm>=coilEngagementRPM(target,state.rate) then
                 setCoils(device,stats,true);setFlow(device,stats,point.flow)
                 commit(record,record.calibration,nil)
                 state.phase="hold";state.rate=0;state.trim=0;state.settleUntil=os.clock()+12

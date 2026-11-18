@@ -1,10 +1,11 @@
-Quicker loaded settling during turbine calibration.
+Close-to-target coil engagement during normal RPM startup.
 
-- Coil engagement during the approach is limited to the final 1.5% of the test speed, rather than potentially switching around 800 RPM for the 900 RPM test.
-- Once engaged, calibration uses measured acceleration to adjust loaded steam flow. It no longer uses the normal operating loop's cautious 90-second lookahead for this test stage.
-- Loaded flow changes remain bounded to 5% of the hardware flow limit per sample. The final stable-flow verification still lasts 30 seconds with coils engaged.
-- Normal calibrated RPM operation, cancel/restoration, shortage detection, overspeed handling and restart recovery remain in place.
+- Saved-profile 900/1800 RPM startup now uses the same coil-engagement threshold as calibration: within the final 1.5% of the target.
+- Removes the old long engagement lead from normal spin-up, including when an existing saved profile contains that value.
+- Already-spinning rotors below 98.5% of the chosen target also use unloaded acceleration rather than immediately engaging coils.
+- Existing calibration profiles remain valid. No recalibration is needed for this update.
+- Braking, loaded fine control, manual overrides and interrupted-spin-up restoration remain unchanged.
 
-Validated with 65 calibration checks plus per-sample assertions, 38 baseline RPM checks, fleet monitor interaction and Load Match regression checks. The slow-rotor simulation that previously spent 196 seconds between engagement and 900 RPM verification now begins verification two seconds after engagement; actual hardware timing will vary. Both targets and imperfect acceleration estimates are covered.
+Validated with 77 calibration/normal-startup checks, 38 baseline RPM checks, fleet monitor interaction and Load Match regression checks. New tests cover both targets from stopped and already-spinning rotors with old long-lead profile data. Hardware timing and overshoot depend on rotor response and sampling.
 
-Cancel the current test, install through INFO > UPDATES, reboot from the CC terminal, then restart calibration with steam supplied and condensate draining.
+Install through INFO > UPDATES, reboot from the CC terminal, then select 900 or 1800 RPM with your existing profile.

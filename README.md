@@ -78,7 +78,7 @@ Use separate ON/OFF and COILS ON/OFF controls. OFF does not instantly brake the 
 
 Turbines retain their active state, coil state and flow settings at startup and reconnect. Each turbine starts in **Manual**. Select **900 RPM** or **1800 RPM** to regulate speed by gradually adjusting steam intake. Selecting a target does not start the turbine or engage its coils: RPM mode waits until those are enabled explicitly.
 
-Choosing 900 or 1800 RPM without a valid saved profile starts calibration, then continues at the selected speed after a successful test. With calibration, it uses measured flow, acceleration and braking response, disengages coils during initial acceleration, and re-engages them before the target. Deceleration keeps coils engaged and cuts steam, then returns to the measured flow near the target. Fine flow corrections are limited to about 1% of the hardware maximum, capped at 25 mB/t per sample. Calibrated startup can select a measured flow directly and use a temporary steam boost; braking can cut flow to zero. It reports insufficient steam, full condensate storage or the hardware flow limit instead of continually increasing demand. Manual flow changes, OFF and COILS OFF cancel RPM mode. MANUAL retains the current flow setting. A failed turbine link disarms RPM mode; opt in again after reconnecting.
+Choosing 900 or 1800 RPM without a valid saved profile starts calibration, then continues at the selected speed after a successful test. With calibration, it uses measured flow, acceleration and braking response, disengages coils during initial acceleration, and re-engages them within the final 1.5% of the target, using the same engagement rule as calibration. Deceleration keeps coils engaged and cuts steam, then returns to the measured flow near the target. Fine flow corrections are limited to about 1% of the hardware maximum, capped at 25 mB/t per sample. Calibrated startup can select a measured flow directly and use a temporary steam boost; braking can cut flow to zero. It reports insufficient steam, full condensate storage or the hardware flow limit instead of continually increasing demand. Manual flow changes, OFF and COILS OFF cancel RPM mode. MANUAL retains the current flow setting. A failed turbine link disarms RPM mode; opt in again after reconnecting.
 
 ### Calibrating a turbine
 
@@ -110,6 +110,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.20.4](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.4)** — Normal saved-profile startup now shares calibration’s close-to-target coil engagement. Already-spinning rotors also accelerate unloaded when below the final approach band. Existing profiles remain usable without recalibration.
 
 - **[v1.20.3](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.3)** — Calibration engages coils closer to each target and uses measured acceleration for loaded settling, avoiding the long slow tail after early coil engagement. Normal calibrated RPM control is unchanged.
 

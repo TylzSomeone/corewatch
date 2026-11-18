@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.21.1"
+local COREWATCH_VERSION = "1.22.0"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -671,7 +671,7 @@ local function showInfo(page)
 		line("Optional speaker: toggle sound from the MODE menu.")
     else
         section("MULTIPLE REACTORS")
-        line("Tap MACHINES in the top bar to select a reactor.")
+        line("Tap OVERVIEW in the top bar to select a machine.")
         line("Each reactor has its own settings, history, and session stats.")
         line("Controllers continue running while another page is visible.")
         line("New RF reactors start in Manual; choose their boot mode.")
@@ -1672,6 +1672,7 @@ function turbineUI.read(record)
     if device.getVariant then local ok,value=pcall(device.getVariant);if ok and type(value)=="string" then stats.variant=value end end
     if device.getInputType then local ok,value=pcall(device.getInputType);if ok and type(value)=="string" then stats.fluid=value end end
     record.stats,record.output,record.unit=stats,stats.power,"FE/t"
+    record.sampleAt=os.clock()
     record.error=nil
     record.status=stats.active and "RUNNING" or "OFF"
     if turbineUI.checkProfile then turbineUI.checkProfile(record,stats) end
@@ -2407,6 +2408,157 @@ do
     end
 end
 
+-- Read-only fleet overview. It uses worker snapshots, never peripheral calls.
+local systemOverview = {}
+do
+    local failed={['LINK LOST']=true,['NOT ASSEMBLED']=true,['CONTROLLER PAUSED']=true,['CHECK PORT']=true}
+    local function healthy(record,now)
+        return not failed[record.status] and record.sampleAt~=nil and now-record.sampleAt<=8
+            and type(record.output)=="number" and record.output==record.output and record.output>=0 and record.output<math.huge
+    end
+    local function fmt(value) return string.format('%.0f',value):reverse():gsub('(%d%d%d)','%1,'):gsub(',$',''):reverse() end
+    local function status(record,live)
+        if not live then
+            local labels={['LINK LOST']="Offline",['NOT ASSEMBLED']="Not assembled",['CONTROLLER PAUSED']="Controller paused",['CHECK PORT']="Check port"}
+            return labels[record.status] or (record.sampleAt and "Readings stale" or "Waiting for readings"),colors.red,true
+        end
+        if record.fuel and record.fuel<5 then return record.fuel<=0 and "No fuel" or "Low fuel",colors.orange,true end
+        if record.kind=="TURBINE" then
+            local s=record.stats
+            if record.calibrationRun then return "Calibrating",colors.cyan,false end
+            if not s then return "Waiting for readings",colors.orange,true end
+            if not s.active then return "Off",colors.lightGray,false end
+            if s.water>=s.tank-1 then return "Water output blocked",colors.orange,true end
+            if s.limit>1 and s.flow+1<s.limit*0.9 and s.steam<=math.max(1,s.flow) then return "Steam shortage",colors.orange,true end
+            if record.profileStale then return "Needs calibration",colors.orange,true end
+            if record.rpmTarget then
+                if math.abs(s.rpm-record.rpmTarget)<=15 and s.coils then return "Stable",colors.lime,false end
+                return s.rpm<record.rpmTarget and "Accelerating" or "Slowing down",colors.cyan,false
+            end
+            return "Manual",colors.lightGray,false
+        elseif record.kind=="STEAM" then
+            if record.steamWarning then return "Needs attention",colors.orange,true end
+            local state=record.steamState or ""
+            if state:find("coolant") then return "Waiting for coolant",colors.orange,true end
+            if state:find("fuel") then return "Waiting for fuel",colors.orange,true end
+            if not record.steamAuto then return record.status=="OFF" and "Off" or "Manual",colors.lightGray,false end
+            local s=record.steamStats
+            if state=="At reactor steam limit" then return "Steam shortage",colors.orange,true end
+            if state=="Steam reserve full" then return "Reserve full",colors.lightGray,false end
+            if state:find("idle") then return "Standby",colors.lightGray,false end
+            if state:find("reserve") or (s and s.steam/s.capacity<0.2) then return "Building reserve",colors.cyan,false end
+            if record.steamDemand and math.abs(record.output-record.steamDemand)<=math.max(5,record.steamDemand*0.1) then
+                return "Stable",colors.lime,false
+            end
+            return "Matching demand",colors.cyan,false
+        end
+        if record.status=="OFF" then return "Off",colors.lightGray,false end
+        return record.mode=="MANUAL" and "Manual" or "Running",record.mode=="MANUAL" and colors.lightGray or colors.lime,false
+    end
+    function systemOverview.snapshot(records,now,filter)
+        local result={entries={},power=0,direct=0,turbinePower=0,steam=0,demand=0,reactors=0,turbines=0,attention=0,unavailable=0}
+        local owners={}
+        for _,record in ipairs(records) do
+            if record.steamLinks then
+                for port,enabled in pairs(record.steamLinks or {}) do if enabled then owners[port]=record.name end end
+            end
+        end
+        for _,record in ipairs(records) do
+            local turbine=record.machineType=="TURBINE"
+            if turbine then result.turbines=result.turbines+1 else result.reactors=result.reactors+1 end
+            local live=healthy(record,now)
+            if not live then result.unavailable=result.unavailable+1 end
+            local label,color,attention=status(record,live)
+            if attention then result.attention=result.attention+1 end
+            local item={record=record,label=label,color=color,attention=attention,live=live}
+            item.kind=turbine and "TURBINE" or record.kind=="STEAM" and "STEAM" or "REACTOR"
+            if live then
+                if record.kind=="STEAM" then
+                    result.steam=result.steam+record.output
+                    item.detail="Steam needed "..(record.steamDemand and fmt(record.steamDemand) or "--").." / produced "..fmt(record.output).." mB/t"
+                    local names={}
+                    for port,enabled in pairs(record.steamLinks or {}) do
+                        if enabled then
+                            local name=port
+                            for _,peer in ipairs(records) do if peer.port==port then name=peer.name;break end end
+                            names[#names+1]=name
+                        end
+                    end
+                    table.sort(names)
+                    item.context=#names>0 and ("Supplies: "..table.concat(names,", ")) or "No turbines paired | tap to set up"
+                elseif turbine then
+                    local s=record.stats
+                    result.turbinePower=result.turbinePower+record.output
+                    if s and s.active and s.water<s.tank-1 then result.demand=result.demand+s.limit end
+                    item.detail=fmt(record.output).." RF/t | RPM "..(s and fmt(s.rpm) or "--")..(record.rpmTarget and (" / "..record.rpmTarget.." target") or " | manual")
+                    item.context=owners[record.port] and ("Steam from: "..owners[record.port]) or "No steam reactor paired"
+                else
+                    result.direct=result.direct+record.output
+                    item.detail=fmt(record.output).." RF/t | "..(record.mode or "Waiting for mode")
+                    item.context=record.fuel and ("Fuel "..string.format("%.0f%%",record.fuel)) or "Tap to open reactor controls"
+                end
+            else
+                item.detail=(record.status or "No readings").." | excluded from totals"
+                item.context="Tap to inspect connection or machine"
+            end
+            if filter==nil or filter=="ALL" or (filter=="REACTORS" and not turbine)
+                or (filter=="TURBINES" and turbine) or (filter=="ATTENTION" and attention) then
+                result.entries[#result.entries+1]=item
+            end
+        end
+        result.power=result.direct+result.turbinePower
+        return result
+    end
+    function systemOverview.draw(screen,w,h,records,now,filter,page,text)
+        local data=systemOverview.snapshot(records,now,filter)
+        local buttons={}
+        local function line(x,y,value,color,maxWidth)
+            text(screen,x,y,tostring(value):sub(1,maxWidth or w-x),color)
+        end
+        local function button(label,x1,y1,x2,y2,action,value,chosen)
+            screen.setBackgroundColor(chosen and colors.blue or colors.gray)
+            for y=y1,y2 do screen.setCursorPos(x1,y);screen.write(string.rep(" ",x2-x1+1)) end
+            line(math.floor((x1+x2-#label+1)/2),y1,label,chosen and colors.white or colors.lightGray)
+            screen.setBackgroundColor(colors.black)
+            buttons[#buttons+1]={x1=x1,y1=y1,x2=x2,y2=y2,action=action,value=value}
+        end
+        line(3,3,"TOTAL POWER  "..fmt(data.power).." RF/t",colors.white)
+        line(3,4,"Direct reactors "..fmt(data.direct).." | Turbines "..fmt(data.turbinePower).." RF/t",colors.lightGray)
+        line(3,5,"STEAM  Needed "..fmt(data.demand).." / produced "..fmt(data.steam).." mB/t",colors.cyan)
+        line(3,6,data.unavailable>0 and (data.unavailable.." machine(s) unavailable; totals exclude their readings") or "Live fleet totals | RF and FE shown as RF/t",data.unavailable>0 and colors.orange or colors.gray)
+        local labels={"ALL","REACTORS","TURBINES","ATTENTION"}
+        local counts={#records,data.reactors,data.turbines,data.attention}
+        local tabWidth=math.floor((w-4)/4)
+        for i,label in ipairs(labels) do
+            local left=3+(i-1)*tabWidth
+            button(label.." "..counts[i],left,7,i==4 and w-2 or left+tabWidth-2,8,"filter",label,filter==label)
+        end
+        local perPage=math.max(1,math.floor((h-14)/4))
+        local pages=math.max(1,math.ceil(#data.entries/perPage));page=math.max(1,math.min(pages,page))
+        line(3,9,"Tap a machine row to open its controls.",colors.lightGray)
+        if #data.entries==0 then line(3,12,filter=="ATTENTION" and "Everything looks clear." or "No machines in this view.",colors.lightGray) end
+        for slot=1,perPage do
+            local item=data.entries[(page-1)*perPage+slot]
+            if item then
+                local top=10+(slot-1)*4
+                local title=item.record.name.." | "..item.kind
+                line(3,top,title,colors.cyan,w-32)
+                line(w-28,top,item.label,item.color,21)
+                line(w-7,top,"OPEN >",colors.lightBlue)
+                line(3,top+1,item.detail,colors.white)
+                line(3,top+2,item.context,colors.lightGray)
+                buttons[#buttons+1]={x1=3,y1=top,x2=w-2,y2=top+2,action="open",value=item.record.port}
+            end
+        end
+        button("< PREV",3,h-2,13,h-1,"page",-1)
+        line(math.floor(w/2)-5,h-2,"Page "..page.."/"..pages,colors.lightGray)
+        button("NEXT >",w-13,h-2,w-3,h-1,"page",1)
+        line(3,h,"Reactors: "..data.reactors.." | Turbines: "..data.turbines,colors.gray)
+        button("MONITORS",w-18,h,w-3,h,"monitors")
+        return buttons,page,data
+    end
+end
+
 -- Fleet supervisor: automatic machine discovery and independent monitor roles.
 local nativeTerminal = term.current()
 local REGISTRY_FILE = "corewatch-machines.txt"
@@ -2461,6 +2613,8 @@ local displayName = peripheral.getName(physical)
 local records, byPort = {}, {}
 local selected = registry.selected
 local overview = true
+local overviewFilter="ALL"
+local overviewButtons={}
 local page = 1
 local pendingFlow
 local displayMenu=false
@@ -2757,6 +2911,7 @@ local function runSteamController(record)
         record.status = active and "RUNNING" or "OFF"
         record.output = steam.fluidProducedLastTick or 0
         record.unit = "mB/t"
+        record.sampleAt=os.clock();record.steamStats=stats
         record.fuel = fuel.fuelCapacity > 0 and fuel.fuelAmount * 100 / fuel.fuelCapacity or 0
         screen.setBackgroundColor(colors.black)
         screen.clear()
@@ -2906,6 +3061,7 @@ local function startWorker(record)
                     state = reason or state
                 end
                 record.status, record.output, record.fuel, record.mode = state, output, fuel, mode
+                if output~=nil then record.sampleAt=os.clock() end
             end,
             function() return selected == record.port end,
             function(release)
@@ -3139,7 +3295,7 @@ local function render()
     local entries = alerts()
     local count = #entries
     alertButton = nil
-    if not showingAlerts then textAt(view, 2, 1, overview and "COREWATCH  |  MACHINES" or "[ MACHINES ]", colors.cyan) end
+    if not showingAlerts then textAt(view, 2, 1, overview and "COREWATCH | OVERVIEW" or "[ OVERVIEW ]", colors.cyan) end
     local record = byPort[selected]
     if displayMenu then
         textAt(view,3,2,"COREWATCH | MONITORS",colors.cyan)
@@ -3151,7 +3307,7 @@ local function render()
             if name~=displayName and y<height-5 then textAt(view,4,y,"[ "..name.." ]",colors.lightBlue);y=y+2 end
         end
         textAt(view,4,height-4,"[ DISABLE TURBINE SCREEN ]",colors.lightBlue)
-        textAt(view,4,height-2,"[ BACK TO MACHINES ]",colors.lightBlue)
+        textAt(view,4,height-2,"[ BACK TO OVERVIEW ]",colors.lightBlue)
     elseif showingAlerts then
         renderAlertList(entries)
     elseif not overview and record then
@@ -3164,7 +3320,10 @@ local function render()
             view.setCursorPos(1, y + 2)
             view.blit(chars, fg, bg)
         end
+    elseif not migration and not pendingName then
+        overviewButtons,page=systemOverview.draw(view,width,height,records,os.clock(),overviewFilter,page,textAt)
     else
+        overviewButtons={}
         local heading = migration and "Choose the ORIGINAL reactor to inherit your existing settings." or "Select a machine. All registered controllers keep working."
         textAt(view, 2, 3, heading, migration and colors.orange or colors.lightGray)
         if pendingName then textAt(view, 2, 3, "Type a name at the CC computer, then press Enter: " .. pendingName, colors.cyan) end
@@ -3295,6 +3454,17 @@ while true do
             end
         elseif overview then
             consumed = true
+            if not migration and not pendingName then
+                for _,button in ipairs(overviewButtons) do
+                    if x>=button.x1 and x<=button.x2 and y>=button.y1 and y<=button.y2 then
+                        if button.action=="filter" then overviewFilter=button.value;page=1
+                        elseif button.action=="page" then page=page+button.value
+                        elseif button.action=="monitors" then displayMenu=true;updateAuxiliary()
+                        elseif button.action=="open" then selected=button.value;overview=false;saveRegistry() end
+                        break
+                    end
+                end
+            else
             local perPage = math.max(1, math.floor((height - 8) / 4))
             if y==height then displayMenu=true;updateAuxiliary()
             elseif y >= height - 2 then
@@ -3312,6 +3482,7 @@ while true do
                     overview = false
                     saveRegistry()
                 end
+            end
             end
         elseif byPort[selected] and byPort[selected].kind=="TURBINE" then
             consumed=true

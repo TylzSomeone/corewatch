@@ -11,11 +11,11 @@ Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Mine
 - Compares energy, fuel burn, efficiency, and duty cycle across modes in **INFO → STATS**.
 - Saves your buffer limits, RF/t target, boot mode, and sound preference.
 - Reconnects when each reactor port returns without stopping other controllers, and can check GitHub for updates.
-- Lists connected reactors under **MACHINES**, with separate settings, names, histories, and RF session statistics.
+- Shows a live system overview with total power, steam balance, machine status, filters and direct access to each machine’s controls.
 - Detects steam reactors, shows steam/coolant readings, and provides manual controls or automatic supply for paired turbines.
 - Automatically discovers turbines and shows RPM, output, stored energy, steam/water, blade efficiency and flow.
 - Provides manual turbine controls, per-turbine calibration and opt-in 900/1800 RPM regulation with automatic coil handling.
-- Assigns one spare monitor to turbines automatically; choose or disable it under **MACHINES → MONITORS**.
+- Assigns one spare monitor to turbines automatically; choose or disable it under **OVERVIEW → MONITORS**.
 
 ## Control modes
 
@@ -58,7 +58,9 @@ shell.run("corewatch")
 
 ## Multiple reactors
 
-Tap **MACHINES** in the persistent top bar to select a reactor. All controllers continue working while you browse another dashboard or the paginated machine list. Tap **ALERTS** in the top bar or machine overview to see affected reactor names, ports, specific problems, and suggested checks. Use **OPEN REACTOR** to jump to that machine; **BACK** returns to the previous view. The list updates as faults clear and supports multiple pages. The count represents affected reactors. Current conditions include paused automatic steam supply, fuel below 5% (with a distinct empty-fuel message), lost links, incomplete assemblies, paused controllers, and unreadable ports. New ports are discovered automatically; saved missing ports remain listed for diagnosis.
+The main **OVERVIEW** shows live total RF/t from direct reactors and turbines, their separate contributions, and total steam needed versus produced. RF and FE are shown as equivalent RF/t. Offline or more-than-eight-second-old readings are excluded, and a notice identifies incomplete totals. Steam totals cover the whole fleet; each paired system still needs its own working fluid connections.
+
+Use **ALL**, **REACTORS**, **TURBINES**, or **ATTENTION** to filter the list. Rows show plain statuses such as Stable, Building reserve, Accelerating, Steam shortage, Off or Manual. Tap anywhere on a machine’s row to open its controls; tap **OVERVIEW** in the top left to return to the same filter/page. The steam reactor names its supplied turbines, and turbine rows name their paired steam reactor. **MONITORS** is available at the bottom right. Large fleets have PREV/NEXT pages. The overview reads cached worker data and does not issue control commands. All controllers continue working while you browse another dashboard or the overview. Tap **ALERTS** in the top bar or machine overview to see affected reactor names, ports, specific problems, and suggested checks. Use **OPEN REACTOR** to jump to that machine; **BACK** returns to the previous view. The list updates as faults clear and supports multiple pages. The count represents affected reactors. Current conditions include paused automatic steam supply, fuel below 5% (with a distinct empty-fuel message), lost links, incomplete assemblies, paused controllers, and unreadable ports. New ports are discovered automatically; saved missing ports remain listed for diagnosis.
 
 When upgrading an existing installation with several reactors connected, first select the **original reactor** to inherit your old settings. Controllers wait for that choice. Other RF reactors begin in **Manual** and retain their existing power state and rod positions until you change them. Configure each reactor's boot mode separately.
 
@@ -68,7 +70,7 @@ Steam reactors show a thin teal production-history trace in mB/t, percentage gau
 
 ## Automatic steam supply
 
-Open your steam reactor under **MACHINES**, tap **PAIR**, and tap each turbine physically supplied by that reactor. A reactor may feed several turbines; a turbine can be paired with only one reactor. Pairing choices are saved in `corewatch-machines.txt`. The list supports multiple pages. Pairing tells Corewatch which demand belongs to the reactor; it does not create fluid connections or route steam. Connect steam pipes and a coolant/condensate return yourself.
+Open your steam reactor under **OVERVIEW**, tap **PAIR**, and tap each turbine physically supplied by that reactor. A reactor may feed several turbines; a turbine can be paired with only one reactor. Pairing choices are saved in `corewatch-machines.txt`. The list supports multiple pages. Pairing tells Corewatch which demand belongs to the reactor; it does not create fluid connections or route steam. Connect steam pipes and a coolant/condensate return yourself.
 
 Tap **BACK**, then **AUTO OFF** to switch it to **AUTO ON**. This explicitly allows the reactor to start, stop and adjust all its rods together. The dashboard shows combined **NEED** and **PRODUCED** in mB/t, plus its current supply status. Existing turbine profiles and speed controls are unchanged.
 
@@ -82,9 +84,9 @@ A missing or unreadable paired turbine makes its reactor stop, fully insert rods
 
 ## Turbines and monitor discovery
 
-Connect each turbine computer port to the same enabled wired network. **MACHINES** discovers new turbine ports automatically, including ports attached while Corewatch runs. Missing registered ports remain listed for diagnosis. Turbine readings update every two seconds.
+Connect each turbine computer port to the same enabled wired network. **OVERVIEW** discovers new turbine ports automatically, including ports attached while Corewatch runs. Missing registered ports remain listed for diagnosis. Turbine readings update every two seconds.
 
-With one spare monitor, Corewatch assigns it to turbines automatically and saves that role. A missing assigned screen is waited for; another screen is not silently substituted. With several spare monitors, choose one under **MACHINES → MONITORS**. The same menu can disable the dedicated screen. Monitor roles and the selected turbine persist in `corewatch-machines.txt`.
+With one spare monitor, Corewatch assigns it to turbines automatically and saves that role. A missing assigned screen is waited for; another screen is not silently substituted. With several spare monitors, choose one under **OVERVIEW → MONITORS**. The same menu can disable the dedicated screen. Monitor roles and the selected turbine persist in `corewatch-machines.txt`.
 
 Tap **TURBINES** on the dedicated screen to switch turbines. Its dashboard shows RPM, FE/t output and history, stored energy, steam and condensate, actual flow, configured flow limit, blade count and efficiency.
 
@@ -124,6 +126,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.22.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.22.0)** — A clearer system overview with live total power, separate reactor/turbine contributions, steam needed versus produced, plain status labels, paired-system context, type/attention filters and tappable machine rows. Return navigation preserves your view; stale/offline readings are excluded from totals.
 
 - **[v1.21.1](https://github.com/TylzSomeone/corewatch/releases/tag/v1.21.1)** — Smoother steam-demand matching with 1% normal rod steps, settling time, filtered production readings and a more conservative restart after full steam. Fixes fractional control getting stuck at fully inserted rods.
 

@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.21.0"
+local COREWATCH_VERSION = "1.21.1"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -2269,7 +2269,7 @@ do
         if not state.parked then state.resumeRod=stats.rodLevel end
         rods(device,stats,100)
         if stats.active then device.setActive(false);stats.active=false end
-        state.parked=true;state.fraction=0;state.previous=nil;state.lastAt=nil
+        state.parked=true;state.fraction=0;state.previous=nil;state.lastAt=nil;state.filtered=nil;state.trend=0;state.lastChangeAt=nil
         record.steamState=message
     end
     function steamUI.manual(record,message)
@@ -2327,11 +2327,18 @@ do
         end
         state.coolantWait=nil
         if fill>=0.9 or (state.fullWait and fill>0.65) then
-            state.fullWait=true;park(record,stats,device,"Steam reserve full");return
+            local firstPause=not state.fullWait
+            local slope=state.slope or (stats.rodLevel<100 and stats.produced/math.max(1,100-stats.rodLevel))
+            state.fullWait=true;park(record,stats,device,"Steam reserve full")
+            if firstPause and slope and slope>0 and demand>0 then
+                -- Do not restart at the same excessive output that filled the tank.
+                state.resumeRod=math.max(state.resumeRod,math.min(100,math.ceil(100-demand/slope)))
+            end
+            return
         end
         state.fullWait=nil
         if not stats.active or state.parked then
-            rods(device,stats,math.min(95,state.resumeRod or stats.rodLevel))
+            rods(device,stats,state.resumeRod or stats.rodLevel)
             if not stats.active then device.setActive(true);stats.active=true end
             state.parked=false;state.expectedActive=true;state.previous=nil;state.lastAt=nil
         end
@@ -2345,22 +2352,40 @@ do
             state.previous,state.lastAt,state.fraction=stats.produced,at,0
             record.steamState="Collecting steam trend";return
         end
-        local trend=(stats.produced-state.previous)/dt
+        -- Smooth the reading before estimating trend: per-sample production
+        -- jitter must not become a large, alternating rod command.
+        local previous=state.filtered or state.previous
+        local alpha=1-math.exp(-dt/6)
+        local filtered=previous+(stats.produced-previous)*alpha
+        state.filtered=filtered
+        state.trend=(state.trend or 0)*0.7+((filtered-previous)/dt)*0.3
         state.previous,state.lastAt=stats.produced,at
-        local slope=state.slope or math.max(1,stats.produced/math.max(1,100-stats.rodLevel))
+        local slope=state.slope or math.max(1,filtered/math.max(1,100-stats.rodLevel))
         state.slope=slope
-        if math.abs(trend)<math.max(1,stats.produced*0.002) and stats.rodLevel<95 then
-            state.slope=slope*0.9+stats.produced/math.max(1,100-stats.rodLevel)*0.1
+        if math.abs(state.trend)<math.max(1,filtered*0.002) and stats.rodLevel<99 then
+            state.slope=slope*0.9+filtered/math.max(1,100-stats.rodLevel)*0.1
         end
-        local errorFlow=stats.produced+trend*20-target
-        local correction=math.max(-3,math.min(3,errorFlow/math.max(1,state.slope)*0.5))
-        if math.abs(errorFlow)<math.max(2,demand*0.015) and math.abs(fill-0.30)<0.05 then correction=0 end
-        state.fraction=(state.fraction or 0)+correction
-        local delta=state.fraction>=0 and math.floor(state.fraction) or math.ceil(state.fraction)
-        state.fraction=state.fraction-delta
-        local level=math.max(0,math.min(100,stats.rodLevel+delta))
-        rods(device,stats,level)
-        if level==0 or level==100 then state.fraction=0 end
+        local errorFlow=filtered+state.trend*40-target
+        local largeSurplus=filtered>math.max(demand*1.8,demand+200)
+        local largeShortage=filtered<demand*0.5 and fill<0.15
+        local step=(largeSurplus or largeShortage) and 3 or 1
+        local interval=step==1 and 6 or 2
+        if not state.lastChangeAt or at-state.lastChangeAt>=interval then
+            local correction=math.max(-step,math.min(step,errorFlow/math.max(1,state.slope)*0.35))
+            if math.abs(errorFlow)<math.max(2,demand*0.02) and math.abs(fill-0.30)<0.05 then correction=0 end
+            if correction*(state.fraction or 0)<0 then state.fraction=0 end
+            state.fraction=(state.fraction or 0)+correction
+            local delta=state.fraction>=0 and math.floor(state.fraction) or math.ceil(state.fraction)
+            state.fraction=state.fraction-delta
+            local level=math.max(0,math.min(100,stats.rodLevel+delta))
+            if level~=stats.rodLevel then
+                rods(device,stats,level);state.lastChangeAt=at
+            end
+            -- Do not discard an inward fractional correction at 0/100%: it
+            -- still needs to accumulate enough to leave that boundary.
+            if (level==0 and correction<0) or (level==100 and correction>0) then state.fraction=0 end
+        end
+        local level=stats.rodLevel
         record.steamState=state.idleFill and "Preparing steam reserve"
             or level==0 and stats.produced<demand*0.95 and "At reactor steam limit"
             or fill<0.20 and "Building steam reserve" or "Matching turbine demand"

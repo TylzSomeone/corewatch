@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.20.1"
+local COREWATCH_VERSION = "1.20.2"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -1993,12 +1993,18 @@ do
         run.stableAt,run.stableFlow,run.stableRPM,run.stableSamples=nil,0,0,0
         record.rpmTarget=target
         record.rpmControl={lastAt=os.clock(),lastRPM=stats.rpm,rate=0,fraction=0}
-        setCoils(device,stats,true)
         local response=run.response
-        if response.drive and response.drive>0 and response.drag and response.drag>0 then
-            local estimate=(response.drag*target+math.max(0,-(response.coastRate or 0)))/response.drive
-            setFlow(device,stats,estimate)
+        local lower=run.points["900"]
+        local estimate=run.probeFlow
+        if lower and lower.status=="ready" then estimate=lower.flow*target/900
+        elseif response.drive and response.drive>0 and response.drag and response.drag>0 then
+            estimate=(response.drag*target+math.max(0,-(response.coastRate or 0)))/response.drive
         end
+        run.loadedFlow=math.max(1,math.min(stats.maxFlow,math.floor(estimate+0.5)))
+        run.approaching=stats.rpm<target*0.9
+        run.approachAt,run.approachRPM=os.clock(),stats.rpm
+        setCoils(device,stats,not run.approaching)
+        setFlow(device,stats,run.approaching and math.max(run.probeFlow,run.loadedFlow*1.25) or run.loadedFlow)
     end
     function turbineUI.calibrateTick(record,stats,device)
         local run=record.calibrationRun
@@ -2049,6 +2055,25 @@ do
                 beginTarget(record,run,stats,device,900)
             end
         elseif run.phase=="target" then
+            if run.approaching then
+                -- Reach the test speed unloaded; only the steady measurement
+                -- requires coils engaged. Keep the original restoration marker.
+                local dt=at-run.approachAt
+                local rate=dt>0 and (stats.rpm-run.approachRPM)/dt or 0
+                run.approachAt,run.approachRPM=at,stats.rpm
+                local lead=run.response.engageSeconds or 6
+                local engageAt=math.max(run.target*0.85,run.target-math.max(10,run.target*0.02)-math.max(0,rate)*lead)
+                if stats.rpm>=engageAt then
+                    run.approaching=false
+                    setCoils(device,stats,true);setFlow(device,stats,run.loadedFlow)
+                    record.rpmControl={lastAt=at,lastRPM=stats.rpm,rate=0,fraction=0}
+                    record.rpmState="Testing "..run.target.." RPM | coils engaged, settling"
+                else
+                    record.rpmState="Testing "..run.target.." RPM | accelerating, coils OFF"
+                    if elapsed>1800 then finish(record,stats,device,"Test timed out accelerating; check steam and rotor") end
+                end
+                return
+            end
             local previous=record.rpmControl and record.rpmControl.lastRPM or stats.rpm
             turbineUI.regulate(record,stats,device)
             local stable=math.abs(stats.rpm-run.target)<=8 and math.abs(stats.rpm-previous)<=0.5

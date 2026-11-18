@@ -84,7 +84,7 @@ Choosing 900 or 1800 RPM without a valid saved profile starts calibration, then 
 
 Supply steam continuously and make sure condensate can leave. Open **CALIBRATE / PROFILE** and select **START TEST**. Calibration changes flow and coil engagement; unloading coils temporarily stops power generation. START TEST turns the turbine on if needed. It never starts or adjusts a reactor.
 
-The staged test measures unloaded coast, acceleration and coil braking, then verifies stable loaded flow at 900 and 1800 RPM. Progress and elapsed time appear on the profile page; BACK lets you watch the normal dashboard while the test continues. **CANCEL TEST** restores the previous flow, coils and original OFF state if the test started the turbine. Failure restores those settings too, except overspeed parks steam at zero with coils engaged. A standalone START TEST restores settings and returns to Manual when complete; a test started by choosing an RPM continues at that speed after successful calibration. Slow rotors can take several minutes to settle.
+The staged test measures unloaded coast, acceleration and coil braking, then climbs toward each test speed with coils disengaged. Coils engage shortly before the target; the test then verifies stable loaded flow at 900 and 1800 RPM. The measured 900 RPM flow helps estimate the 1800 RPM starting flow. Progress and elapsed time appear on the profile page; BACK lets you watch the normal dashboard while the test continues. **CANCEL TEST** restores the previous flow, coils and original OFF state if the test started the turbine. Failure restores those settings too, except overspeed parks steam at zero with coils engaged. A standalone START TEST restores settings and returns to Manual when complete; a test started by choosing an RPM continues at that speed after successful calibration. Slow rotors can take several minutes to settle.
 
 Each turbine's measured profile is saved separately in `corewatch-machines.txt`. A valid 900 RPM result is retained if 1800 RPM exceeds available capacity. Insufficient steam, blocked condensate, changing hardware or failure to settle are reported rather than saved as working targets. An overspeed abort parks flow at zero with coils engaged. Other interrupted tests retain a saved restoration marker; startup or reconnect restores those settings without turning turbine power on.
 
@@ -110,6 +110,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.20.2](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.2)** — Calibration now accelerates with coils OFF toward both test speeds, then engages coils near the target to measure generating flow. Uses the measured 900 RPM flow to seed the 1800 RPM test.
 
 - **[v1.20.1](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.1)** — START TEST powers on the selected turbine when needed. Choosing an uncalibrated RPM starts calibration and continues at that speed on success. Cancel, failure and restart restore the earlier settings without resuming a pending speed selection.
 

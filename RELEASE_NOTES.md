@@ -1,12 +1,15 @@
-Opt-in automatic turbine RPM control.
+Per-turbine calibration and automatic coil handling.
 
-- Choose MANUAL, 900 RPM or 1800 RPM independently for each turbine.
-- RPM mode adjusts steam intake gradually and considers rotor acceleration when approaching the target.
-- Selecting a target never starts the turbine or changes coil engagement. It waits while the turbine or coils are off.
-- Reports steam-supply limits, full condensate storage and maximum flow.
-- Manual flow changes, OFF or COILS OFF disarm RPM mode. MANUAL keeps the current flow setting. Startup and reconnect return to Manual without changing hardware settings.
-- The steam reactor stays under independent manual control; this release does not coordinate reactor steam production.
+- CALIBRATE / PROFILE > START TEST measures coast, acceleration, coil braking and stable flow at 900 and 1800 RPM.
+- Saved profiles are specific to each turbine. Calibrated RPM mode unloads coils during initial acceleration, engages them before the target, and keeps them engaged while braking with reduced steam.
+- Measured steady flows provide the starting point; fine correction handles small differences. Without calibration, existing gentle flow-only RPM control remains available.
+- Detected rotor/hardware changes invalidate profiles. Coil-only changes require recalibration; persistent changed response can flag a profile check.
+- Test progress and cancellation are available on the monitor. Cancel and completion restore previous flow and coils. A working lower target survives an unreachable upper target.
+- Interrupted calibration or unloaded spin-up has a durable restoration marker, so settings are restored after reboot or reconnect. Turbine power is never switched on automatically. Normal startup remains Manual.
+- Blocked condensate, inadequate steam, timeout and overspeed have explicit outcomes. Overspeed stops calibration at zero flow with coils engaged.
 
-Validated with delayed rotor simulations for both targets, varying response times and load, bounded flow changes, starvation, capacity limits, manual overrides, link failures and safe startup. Multi-machine monitor routing and the RF Load Match regression checks also pass. Live tuning may vary with turbine construction; try 900 RPM first and observe its response.
+To calibrate: turbine ON, steam supplied continuously, condensate able to leave, then CALIBRATE / PROFILE > START TEST. The test changes flow/coils and can take several minutes. The steam reactor remains independent.
 
-Install through INFO > UPDATES > CHECK > INSTALL, then open the CC computer terminal and hold Ctrl+R there. Existing reactor and monitor settings are preserved.
+Validated with 40 calibration checks and 38 baseline RPM checks, physical rotor simulations at several response speeds, main/dedicated monitor interactions, per-turbine persistence and interrupted-test recovery. Fleet and Load Match regression checks also pass. Live hardware testing is ongoing.
+
+Install through INFO > UPDATES > CHECK > INSTALL, then open the CC computer terminal and hold Ctrl+R there. One downloadable corewatch file still contains the full program; profiles are kept in the existing machine registry.

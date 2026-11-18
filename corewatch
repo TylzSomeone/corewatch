@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.19.0"
+local COREWATCH_VERSION = "1.20.0"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -690,7 +690,7 @@ local function showInfo(page)
         line("RF control modes do not regulate steam reactors.")
         line("MACHINES > MONITORS assigns the dedicated turbine screen.")
         line("One spare monitor is assigned automatically; choices are saved.")
-        line("Turbines: Manual or 900/1800 RPM. RPM mode adjusts steam intake only.")
+        line("Turbines: calibrate, then choose 900/1800 RPM with automatic coils.")
 
 	end
 
@@ -1645,6 +1645,8 @@ end
 -- Embedded by build-multireactor.py; installations still use a single file.
 local turbineUI = {}
 function turbineUI.reset(record)
+    if record.calibrationRun then record.calibrationMessage="Calibration interrupted; restoring when connected" end
+    record.calibrationRun=nil
     record.rpmTarget=nil
     record.rpmControl=nil
     record.rpmState=nil
@@ -1666,9 +1668,13 @@ function turbineUI.read(record)
         tank=read("getFluidAmountMax","number"),flow=read("getFluidFlowRate","number"),
         limit=read("getFluidFlowRateMax","number"),maxFlow=read("getFluidFlowRateMaxMax","number"),
         blades=read("getNumberOfBlades","number"),efficiency=read("getBladeEfficiency","number")}
+    stats.mass=device.getRotorMass and read("getRotorMass","number") or 0
+    if device.getVariant then local ok,value=pcall(device.getVariant);if ok and type(value)=="string" then stats.variant=value end end
+    if device.getInputType then local ok,value=pcall(device.getInputType);if ok and type(value)=="string" then stats.fluid=value end end
     record.stats,record.output,record.unit=stats,stats.power,"FE/t"
     record.error=nil
     record.status=stats.active and "RUNNING" or "OFF"
+    if turbineUI.checkProfile then turbineUI.checkProfile(record,stats) end
     return stats,device
 end
 function turbineUI.regulate(record,stats,device)
@@ -1679,7 +1685,8 @@ function turbineUI.regulate(record,stats,device)
     local elapsed=at-state.lastAt
     local previousRPM=state.lastRPM
     state.lastRPM,state.lastAt=stats.rpm,at
-    if not stats.active or not stats.coils then
+    local calibrated=turbineUI.profileFor and turbineUI.profileFor(record,record.rpmTarget)
+    if not stats.active or (not stats.coils and not calibrated) then
         state.rate,state.fraction=0,0
         record.rpmState=not stats.active and "Waiting: turbine OFF" or "Waiting: coils OFF"
         return
@@ -1690,6 +1697,7 @@ function turbineUI.regulate(record,stats,device)
         return
     end
     state.rate=0.5*state.rate+0.5*(stats.rpm-previousRPM)/elapsed
+    if turbineUI.motion and not record.calibrationRun and turbineUI.motion(record,stats,device,state,calibrated) then return end
     local errorRPM=record.rpmTarget-stats.rpm
     if math.abs(errorRPM)<=8 and math.abs(state.rate)<0.25 then
         state.fraction=0;record.rpmState="Holding target";return
@@ -1726,7 +1734,11 @@ function turbineUI.regulate(record,stats,device)
 end
 function turbineUI.sample(record)
     local stats,device=turbineUI.read(record)
-    turbineUI.regulate(record,stats,device)
+    if record.restorePending and not record.calibrationRun and not record.rpmTarget and turbineUI.restore then
+        turbineUI.restore(record,stats,device)
+    end
+    if record.calibrationRun then turbineUI.calibrateTick(record,stats,device)
+    else turbineUI.regulate(record,stats,device) end
     record.history=record.history or {}
     record.history[#record.history+1]=stats.power
     while #record.history>90 do table.remove(record.history,1) end
@@ -1734,15 +1746,31 @@ end
 function turbineUI.control(record,action,value)
     -- Re-read the exact selected port immediately before every manual write.
     local stats,device=turbineUI.read(record)
+    if action=="calibration-page" then record.calibrationPage=true;return
+    elseif action=="back-calibration" then record.calibrationPage=false;return
+    elseif action=="start-calibration" then return turbineUI.beginCalibration(record,stats,device)
+    elseif action=="cancel-calibration" then return turbineUI.cancelCalibration(record,stats,device) end
+    if record.calibrationRun then
+        assert(action~="rpm","Cancel the calibration test before choosing an RPM")
+        turbineUI.cancelCalibration(record,stats,device)
+        stats,device=turbineUI.read(record)
+    elseif record.restorePending and turbineUI.restore then
+        turbineUI.reset(record);turbineUI.restore(record,stats,device)
+        stats,device=turbineUI.read(record)
+    end
+    record.calibrationMessage=nil
     if action=="manual" then
         turbineUI.reset(record)
         record.controlMessage="Manual: current flow retained";return
     elseif action=="rpm" then
         assert(value==900 or value==1800,"Choose 900 or 1800 RPM")
+        assert(not record.profileStale,"Turbine changed: recalibrate before using RPM mode")
+        local point=record.calibration and record.calibration.points and record.calibration.points[tostring(value)]
+        assert(not point or point.status~="unreachable","Calibration could not reach this RPM at maximum flow")
         record.rpmTarget=value
-        record.rpmControl={lastRPM=stats.rpm,lastAt=os.clock(),fraction=0,rate=0}
+        record.rpmControl={lastRPM=stats.rpm,lastAt=os.clock(),fraction=0,rate=0,initial=true}
         record.rpmState="Selected; waiting for next sample"
-        record.controlMessage="RPM mode adjusts only steam flow";return
+        record.controlMessage=turbineUI.profileFor and turbineUI.profileFor(record,value) and "Using calibrated flow and automatic coils" or "Uncalibrated: gentle flow control";return
     elseif action=="on" or action=="off" then
         device.setActive(action=="on")
         if action=="off" then turbineUI.reset(record) end
@@ -1792,6 +1820,10 @@ function turbineUI.draw(record,screen,w,h)
         text(2,4,"Expand monitor or use MACHINES.",colors.white)
         return buttons
     end
+    if record.calibrationPage and turbineUI.drawCalibration then
+        turbineUI.drawCalibration(record,screen,w,h,text,button)
+        return buttons
+    end
     text(3,1,"COREWATCH | TURBINE",colors.cyan)
     local stats=record.stats
     if not stats or record.status=="LINK LOST" or record.status=="NOT ASSEMBLED" or record.status=="CONTROLLER PAUSED" then
@@ -1811,6 +1843,7 @@ function turbineUI.draw(record,screen,w,h)
     text(3,7,"OUTPUT "..fmt(stats.power).." FE/t",colors.white)
     text(3,8,"STORED "..fmt(stats.stored).." / "..fmt(stats.capacity).." FE",colors.lightGray)
     bar(9,stats.stored,stats.capacity,colors.cyan)
+    if turbineUI.beginCalibration then button(record.calibrationRun and "CALIBRATING - VIEW / CANCEL" or "CALIBRATE / PROFILE",3,10,w-4,"calibration-page") end
     text(3,11,"STEAM "..fmt(stats.steam).." / "..fmt(stats.tank).." mB",colors.lightGray)
     text(3,12,"WATER "..fmt(stats.water).." mB (shared tank)",colors.lightGray)
     text(3,14,"FLOW "..fmt(stats.flow).." / "..fmt(stats.limit).." mB/t",colors.white)
@@ -1841,8 +1874,305 @@ function turbineUI.draw(record,screen,w,h)
         end
     end
     text(3,h,record.flowInput~=nil and ("Type flow at computer: "..record.flowInput.." [Enter]")
-        or record.controlMessage or "Steam reactor stays independent.",record.flowInput~=nil and colors.cyan or colors.gray)
+        or record.calibrationMessage or record.controlMessage or "Steam reactor stays independent.",record.flowInput~=nil and colors.cyan or colors.gray)
     return buttons
+end
+
+-- Per-port calibration. No reactor is started or adjusted by this module.
+do
+    local function signature(stats)
+        return {blades=stats.blades,mass=stats.mass,maxFlow=stats.maxFlow,variant=stats.variant,fluid=stats.fluid}
+    end
+    local function sameSignature(saved,stats)
+        return type(saved)=="table" and saved.blades==stats.blades and saved.mass==stats.mass
+            and saved.maxFlow==stats.maxFlow and (not saved.variant or saved.variant==stats.variant)
+            and (not saved.fluid or saved.fluid=="" or not stats.fluid or stats.fluid=="" or saved.fluid==stats.fluid)
+    end
+    local function commit(record,profile,pending)
+        assert(type(record.saveTurbineState)=="function","Calibration storage is unavailable")
+        record.saveTurbineState(profile,pending)
+        record.calibration,record.restorePending=profile,pending
+    end
+    local function setFlow(device,stats,flow)
+        flow=math.floor(math.max(0,math.min(stats.maxFlow,flow))+0.5)
+        if stats.limit~=flow then device.setFluidFlowRateMax(flow);stats.limit=flow end
+    end
+    local function setCoils(device,stats,engaged)
+        if stats.coils~=engaged then device.setInductorEngaged(engaged);stats.coils=engaged end
+    end
+    function turbineUI.checkProfile(record,stats)
+        local profile=record.calibration
+        record.profileStale=profile~=nil and (type(profile)~="table" or profile.schema~=1
+            or type(profile.points)~="table" or not sameSignature(profile.signature,stats)) or false
+        if record.profileStale and record.rpmTarget and not record.calibrationRun then
+            turbineUI.reset(record)
+            record.controlMessage="Turbine changed: recalibrate"
+            record.calibrationMessage="Turbine changed: recalibrate"
+        end
+    end
+    function turbineUI.profileFor(record,target)
+        if record.profileStale or record.calibrationRun then return nil end
+        local profile=record.calibration
+        local point=type(profile)=="table" and type(profile.points)=="table" and profile.points[tostring(target)]
+        if type(point)=="table" and point.status=="ready" and type(point.flow)=="number"
+            and point.flow>0 and point.flow<math.huge and point.flow==math.floor(point.flow)
+            and record.stats and point.flow<=record.stats.maxFlow then return point end
+    end
+    function turbineUI.restore(record,stats,device)
+        local pending=record.restorePending
+        if not pending then return end
+        assert(type(pending)=="table" and type(pending.flow)=="number" and pending.flow==pending.flow
+            and pending.flow>=0 and pending.flow<math.huge and type(pending.coils)=="boolean","Invalid saved turbine restoration")
+        -- The marker stays durable until both idempotent writes have succeeded.
+        setFlow(device,stats,pending.flow)
+        setCoils(device,stats,pending.coils)
+        commit(record,record.calibration,nil)
+        record.controlMessage="Previous settings restored; Manual"
+    end
+    local function startPhase(run,name,stats)
+        run.phase,run.phaseAt,run.phaseRPM=name,os.clock(),stats.rpm
+        run.flowTotal,run.flowSamples=0,0
+    end
+    local function finish(record,stats,device,message)
+        local run=record.calibrationRun
+        if run then
+            local profile
+            for _,point in pairs(run.points) do if point.status=="ready" or point.status=="unreachable" then profile=true end end
+            if profile then
+                profile={schema=1,signature=run.signature,points=run.points,response=run.response,time=os.epoch("utc")/1000}
+                commit(record,profile,record.restorePending)
+            end
+        end
+        turbineUI.reset(record)
+        turbineUI.restore(record,stats,device)
+        record.calibrationMessage=message
+        turbineUI.checkProfile(record,stats)
+    end
+    function turbineUI.cancelCalibration(record,stats,device)
+        if not record.calibrationRun and not record.restorePending then return end
+        -- Cancellation never replaces an existing profile with partial results.
+        turbineUI.reset(record)
+        turbineUI.restore(record,stats,device)
+        record.calibrationMessage="Test cancelled; previous settings restored"
+    end
+    function turbineUI.beginCalibration(record,stats,device)
+        assert(not record.calibrationRun,"Calibration is already running")
+        assert(stats.active,"Turn the turbine ON before starting calibration")
+        assert(stats.blades>0 and stats.mass>0 and stats.maxFlow>=1,"A complete rotor and rotor-mass readings are required")
+        assert(stats.steam>0 or stats.flow>0,"Supply steam before starting calibration")
+        assert(stats.tank>0 and stats.water<stats.tank-1,"Clear the condensate output before calibration")
+        if record.restorePending then turbineUI.reset(record);turbineUI.restore(record,stats,device) end
+        local pending={flow=stats.limit,coils=stats.coils}
+        -- Store restoration BEFORE the first change, including across a reboot.
+        commit(record,record.calibration,pending)
+        turbineUI.reset(record)
+        local run={signature=signature(stats),points={},response={},started=os.clock(),
+            probeFlow=math.max(1,math.min(stats.maxFlow,math.max(10,math.floor(stats.maxFlow*0.1))))}
+        record.calibrationRun=run;record.calibrationMessage=nil;record.profileSuspect=nil
+        if stats.rpm>1200 then
+            startPhase(run,"prepare",stats);setCoils(device,stats,true);setFlow(device,stats,0)
+        else startPhase(run,"coast",stats);setFlow(device,stats,0);setCoils(device,stats,false) end
+    end
+    local function beginTarget(record,run,stats,device,target)
+        run.target=target;startPhase(run,"target",stats)
+        run.stableAt,run.stableFlow,run.stableRPM,run.stableSamples=nil,0,0,0
+        record.rpmTarget=target
+        record.rpmControl={lastAt=os.clock(),lastRPM=stats.rpm,rate=0,fraction=0}
+        setCoils(device,stats,true)
+        local response=run.response
+        if response.drive and response.drive>0 and response.drag and response.drag>0 then
+            local estimate=(response.drag*target+math.max(0,-(response.coastRate or 0)))/response.drive
+            setFlow(device,stats,estimate)
+        end
+    end
+    function turbineUI.calibrateTick(record,stats,device)
+        local run=record.calibrationRun
+        if not run then return end
+        local at=os.clock()
+        if not sameSignature(run.signature,stats) then finish(record,stats,device,"Turbine changed during test; recalibrate");return end
+        if not stats.active then finish(record,stats,device,"Test stopped: turbine was turned OFF");return end
+        if stats.rpm>2050 then
+            commit(record,record.calibration,{flow=0,coils=true})
+            finish(record,stats,device,"RPM too high: test stopped, flow zero, coils ON");return
+        end
+        if at-run.started>4200 then finish(record,stats,device,"Test timed out; no unmeasured target was saved");return end
+        if stats.water>=stats.tank-1 then finish(record,stats,device,"Test stopped: condensate output blocked");return end
+        if stats.limit>1 and stats.flow+1<stats.limit*0.9 and stats.steam<=math.max(1,stats.flow) then
+            run.shortageAt=run.shortageAt or at
+            if at-run.shortageAt>=10 then
+                if run.target then run.points[tostring(run.target)]={status="unavailable",reason="Insufficient steam during test"} end
+                finish(record,stats,device,"Test stopped: insufficient steam; supply more and retry");return
+            end
+        else run.shortageAt=nil end
+        local elapsed=at-run.phaseAt
+        run.flowTotal=run.flowTotal+stats.flow;run.flowSamples=run.flowSamples+1
+        if run.phase=="prepare" then
+            record.rpmState="Preparing: braking below 1200 RPM"
+            if stats.rpm<=1200 then startPhase(run,"coast",stats);setCoils(device,stats,false)
+            elseif elapsed>600 then finish(record,stats,device,"Test stopped: rotor did not slow in time") end
+        elseif run.phase=="coast" then
+            record.rpmState="Measuring unloaded coast"
+            if elapsed>=6 then
+                run.response.coastRate=(stats.rpm-run.phaseRPM)/elapsed
+                startPhase(run,"accelerate",stats);setFlow(device,stats,run.probeFlow)
+            end
+        elseif run.phase=="accelerate" then
+            record.rpmState="Measuring acceleration (coils OFF)"
+            if elapsed>=8 or stats.rpm>=1400 then
+                run.response.accelRate=(stats.rpm-run.phaseRPM)/math.max(1,elapsed)
+                local flow=run.flowTotal/math.max(1,run.flowSamples)
+                run.response.drive=math.max(0,(run.response.accelRate-run.response.coastRate)/math.max(1,flow))
+                startPhase(run,"brake",stats);setCoils(device,stats,true)
+            end
+        elseif run.phase=="brake" then
+            record.rpmState="Measuring coil braking"
+            if elapsed>=8 then
+                local rate=(stats.rpm-run.phaseRPM)/elapsed
+                run.response.brakeDelta=math.max(0,run.response.accelRate-rate)
+                run.response.drag=run.response.brakeDelta/math.max(1,(stats.rpm+run.phaseRPM)/2)
+                run.response.engageSeconds=math.max(4,math.min(12,2*math.max(0,run.response.accelRate)/math.max(0.01,run.response.brakeDelta)))
+                beginTarget(record,run,stats,device,900)
+            end
+        elseif run.phase=="target" then
+            local previous=record.rpmControl and record.rpmControl.lastRPM or stats.rpm
+            turbineUI.regulate(record,stats,device)
+            local stable=math.abs(stats.rpm-run.target)<=8 and math.abs(stats.rpm-previous)<=0.5
+                and stats.flow>0 and stats.limit>0
+                and stats.coils and math.abs(stats.flow-stats.limit)<=math.max(1,stats.limit*0.05)
+                and not run.shortageAt
+            if stable then
+                run.stableAt=run.stableAt or at
+                run.stableFlow=run.stableFlow+stats.flow;run.stableRPM=run.stableRPM+stats.rpm;run.stableSamples=run.stableSamples+1
+                if at-run.stableAt>=30 then
+                    run.points[tostring(run.target)]={status="ready",flow=math.max(1,math.floor(run.stableFlow/run.stableSamples+0.5)),
+                        rpm=run.stableRPM/run.stableSamples,power=stats.power}
+                    if run.target==900 then beginTarget(record,run,stats,device,1800)
+                    else finish(record,stats,device,"Calibration saved; original settings restored") end
+                    return
+                end
+            else run.stableAt,run.stableFlow,run.stableRPM,run.stableSamples=nil,0,0,0 end
+            record.rpmState="Testing "..run.target.." RPM | "..(stable and "verifying steady flow" or "settling")
+            if stats.limit>=stats.maxFlow and stats.rpm<run.target-20 and math.abs(stats.rpm-previous)<=0.5 and not run.shortageAt then
+                run.limitedAt=run.limitedAt or at
+                if at-run.limitedAt>=60 then
+                    run.points[tostring(run.target)]={status="unreachable",reason="Maximum flow reached below target"}
+                    if run.target==900 then run.points['1800']={status="unreachable",reason="900 RPM already exceeded available capacity"} end
+                    finish(record,stats,device,"Target not achievable at maximum flow; measured points saved");return
+                end
+            else run.limitedAt=nil end
+            if elapsed>1800 then
+                run.points[tostring(run.target)]={status="unavailable",reason="Did not settle within test time"}
+                finish(record,stats,device,"Test timed out settling; measured points saved")
+            end
+        end
+    end
+    function turbineUI.motion(record,stats,device,state,point)
+        if not point then return false end
+        local target=record.rpmTarget
+        local margin=math.max(20,target*0.025)
+        local waterBlocked=stats.tank>0 and stats.water>=stats.tank-1
+        local steamLimited=stats.limit>1 and stats.flow+1<stats.limit*0.9 and stats.steam<=math.max(1,stats.flow)
+        if waterBlocked or (steamLimited and state.phase=="spinup") then
+            setCoils(device,stats,true);setFlow(device,stats,waterBlocked and 0 or point.flow)
+            if record.restorePending then commit(record,record.calibration,nil) end
+            state.initial=false;state.phase="hold";state.resumeBaseline=waterBlocked
+            record.rpmState=waterBlocked and "Condensate output blocked" or "Steam supply limited"
+            return true
+        end
+        if state.resumeBaseline then state.resumeBaseline=nil;setFlow(device,stats,point.flow);return true end
+        if stats.rpm>target+margin and state.phase~="brake" then
+            state.phase="brake";setCoils(device,stats,true);setFlow(device,stats,0)
+            record.rpmState="Braking with coils engaged";return true
+        end
+        if state.phase=="brake" then
+            if stats.rpm+math.min(0,state.rate)*4>target+5 then
+                record.rpmState="Braking with coils engaged";return true
+            end
+            setFlow(device,stats,point.flow)
+            if record.restorePending then commit(record,record.calibration,nil) end
+            state.phase="hold";state.rate=0;state.trim=0;state.settleUntil=os.clock()+12;return true
+        end
+        if state.initial then
+            state.initial=false
+            if stats.rpm<target*0.8 and stats.steam>0 then
+                -- A crash during unloaded spin-up restores this known loaded
+                -- operating point. It never turns turbine power on.
+                commit(record,record.calibration,{flow=point.flow,coils=true})
+                setFlow(device,stats,math.min(stats.maxFlow,math.max(point.flow,point.flow*1.25)))
+                setCoils(device,stats,false);state.phase="spinup"
+            else
+                setCoils(device,stats,true);setFlow(device,stats,point.flow)
+                state.phase="hold";state.trim=0;state.settleUntil=os.clock()+12;return true
+            end
+        end
+        if state.phase=="spinup" then
+            local response=record.calibration.response or {}
+            local lead=response.engageSeconds or 6
+            if stats.rpm+math.max(0,state.rate)*lead>=target-math.max(10,target*0.02) then
+                setCoils(device,stats,true);setFlow(device,stats,point.flow)
+                commit(record,record.calibration,nil)
+                state.phase="hold";state.rate=0;state.trim=0;state.settleUntil=os.clock()+12
+                record.rpmState="Coils engaged; settling on saved flow"
+            else record.rpmState="Accelerating with coils disengaged" end
+            return true
+        end
+        if not stats.coils then setCoils(device,stats,true) end
+        if state.settleUntil and os.clock()<state.settleUntil then
+            record.rpmState="Settling on calibrated flow";return true
+        end
+        if math.abs(stats.limit-point.flow)>math.max(10,point.flow*0.25) and math.abs(state.rate)<0.5
+            and not steamLimited and math.abs(stats.flow-stats.limit)<=math.max(1,stats.limit*0.05) then
+            state.driftAt=state.driftAt or os.clock()
+            if os.clock()-state.driftAt>=90 then
+                record.profileSuspect=true;record.calibrationMessage="Response changed: recalibration recommended"
+            end
+        else state.driftAt=nil end
+        local errorRPM=target-stats.rpm
+        if steamLimited and errorRPM>8 then record.rpmState="Steam supply limited";return true end
+        if math.abs(errorRPM)<=8 and math.abs(state.rate)<0.25 then record.rpmState="Holding target";return true end
+        if stats.limit>=stats.maxFlow and errorRPM>8 and state.rate<=0.25 then
+            record.rpmState="At maximum steam flow";return true
+        end
+        local ratio=point.flow/target
+        local response=record.calibration.response or {}
+        local lead=math.max(5,math.min(90,0.5/math.max(0.001,response.drag or 0.01)))
+        state.trim=math.max(-point.flow,math.min(stats.maxFlow-point.flow,(state.trim or 0)+errorRPM*ratio*0.01))
+        local requested=point.flow+state.trim+errorRPM*ratio*0.25-state.rate*ratio*lead
+        local step=math.max(1,math.min(25,math.floor(stats.maxFlow*0.01)))
+        setFlow(device,stats,math.max(stats.limit-step,math.min(stats.limit+step,requested)))
+        record.rpmState="Fine tuning calibrated flow"
+        return true
+    end
+    function turbineUI.drawCalibration(record,screen,w,h,text,button)
+        text(3,1,"TURBINE CALIBRATION",colors.cyan)
+        local profile=record.calibration
+        text(3,3,record.profileStale and "PROFILE OUTDATED - recalibrate" or (record.profileSuspect and "PROFILE CHECK RECOMMENDED" or (profile and "Saved profile" or "No saved profile")),(record.profileStale or record.profileSuspect) and colors.orange or colors.white)
+        for index,target in ipairs({900,1800}) do
+            local point=type(profile)=="table" and type(profile.points)=="table" and profile.points[tostring(target)]
+            local description=point and (point.status=="ready" and (point.flow.." mB/t") or point.status) or "not measured"
+            text(3,4+index,target.." RPM: "..description,colors.lightGray)
+        end
+        if record.calibrationRun then
+            local run=record.calibrationRun
+            text(3,8,"TEST RUNNING: "..(record.rpmState or run.phase),colors.cyan)
+            text(3,10,"RPM "..string.format("%.1f",record.stats.rpm).." | Flow "..record.stats.limit,colors.white)
+            text(3,12,"Elapsed "..math.floor(os.clock()-run.started).."s",colors.gray)
+            text(3,14,"Other machines continue independently.",colors.gray)
+        else
+            text(3,8,"Tests acceleration, braking, then",colors.lightGray)
+            text(3,9,"steady flow at 900 and 1800 RPM.",colors.lightGray)
+            text(3,11,"Changes steam flow and coil engagement.",colors.orange)
+            text(3,12,"Turbine must be ON; steam supplied",colors.lightGray)
+            text(3,13,"and condensate able to leave.",colors.lightGray)
+            text(3,15,"May take several minutes. Cancel restores",colors.gray)
+            text(3,16,"previous flow and coils. Reactor untouched.",colors.gray)
+        end
+        local half=math.floor((w-4)/2)
+        button(record.calibrationRun and "CANCEL TEST" or "START TEST",3,h-3,half,record.calibrationRun and "cancel-calibration" or "start-calibration")
+        button("BACK",3+half,h-3,w-4-half,"back-calibration")
+        text(3,h,record.calibrationMessage or record.controlMessage or "Coil changes require recalibration.",colors.orange)
+        return {}
+    end
 end
 
 -- Fleet supervisor: automatic machine discovery and independent monitor roles.
@@ -1988,6 +2318,16 @@ local function scan()
             frame.isColor = physical.isColor
             frame.isColour = physical.isColour or physical.isColor
             local record = {port = port, name = saved.name, screen = frame, status = "CONNECTING",machineType=turbine and "TURBINE" or "REACTOR"}
+            if turbine then
+                record.calibration=saved.calibration
+                record.restorePending=saved.calibrationRestore
+                record.saveTurbineState=function(profile,pending)
+                    local oldProfile,oldPending=saved.calibration,saved.calibrationRestore
+                    saved.calibration,saved.calibrationRestore=profile,pending
+                    local ok,reason=pcall(saveRegistry)
+                    if not ok then saved.calibration,saved.calibrationRestore=oldProfile,oldPending;error(reason,0) end
+                end
+            end
             record.phase = (#records * 0.07) % 2
             records[#records + 1], byPort[port] = record, record
             if not selected then selected = port end

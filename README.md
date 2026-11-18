@@ -14,7 +14,7 @@ Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Mine
 - Lists connected reactors under **MACHINES**, with separate settings, names, histories, and RF session statistics.
 - Detects steam reactors and provides steam/coolant readings plus manual power and rod controls.
 - Automatically discovers turbines and shows RPM, output, stored energy, steam/water, blade efficiency and flow.
-- Provides manual turbine ON/OFF, coil engagement and flow-limit controls, plus opt-in 900/1800 RPM regulation.
+- Provides manual turbine controls, per-turbine calibration and opt-in 900/1800 RPM regulation with automatic coil handling.
 - Assigns one spare monitor to turbines automatically; choose or disable it under **MACHINES → MONITORS**.
 
 ## Control modes
@@ -78,7 +78,19 @@ Use separate ON/OFF and COILS ON/OFF controls. OFF does not instantly brake the 
 
 Turbines retain their active state, coil state and flow settings at startup and reconnect. Each turbine starts in **Manual**. Select **900 RPM** or **1800 RPM** to regulate speed by gradually adjusting steam intake. Selecting a target does not start the turbine or engage its coils: RPM mode waits until those are enabled explicitly.
 
-The controller considers rotor acceleration so it can ease steam intake before overshooting. Flow adjustments are limited to 1% of the hardware maximum, capped at 25 mB/t per two-second sample. It reports insufficient steam, full condensate storage or the hardware flow limit instead of continually increasing demand. Manual flow changes, OFF and COILS OFF cancel RPM mode. MANUAL retains the current flow setting. A failed turbine link disarms RPM mode; opt in again after reconnecting.
+Without a saved calibration, the controller uses gentle flow-only regulation. With calibration, it uses measured flow, acceleration and braking response, disengages coils during initial acceleration, and re-engages them before the target. Deceleration keeps coils engaged and cuts steam, then returns to the measured flow near the target. Fine flow corrections are limited to about 1% of the hardware maximum, capped at 25 mB/t per sample. Calibrated startup can select a measured flow directly and use a temporary steam boost; braking can cut flow to zero. It reports insufficient steam, full condensate storage or the hardware flow limit instead of continually increasing demand. Manual flow changes, OFF and COILS OFF cancel RPM mode. MANUAL retains the current flow setting. A failed turbine link disarms RPM mode; opt in again after reconnecting.
+
+### Calibrating a turbine
+
+Turn the turbine ON, supply steam continuously, and make sure condensate can leave. Open **CALIBRATE / PROFILE** and select **START TEST**. Calibration changes flow and coil engagement; unloading coils temporarily stops power generation. It never starts or adjusts a reactor, and never turns turbine power on.
+
+The staged test measures unloaded coast, acceleration and coil braking, then verifies stable loaded flow at 900 and 1800 RPM. Progress and elapsed time appear on the profile page; BACK lets you watch the normal dashboard while the test continues. **CANCEL TEST** restores the previous flow and coil setting. Completion also restores those settings and returns to Manual. Slow rotors can take several minutes to settle.
+
+Each turbine's measured profile is saved separately in `corewatch-machines.txt`. A valid 900 RPM result is retained if 1800 RPM exceeds available capacity. Insufficient steam, blocked condensate, changing hardware or failure to settle are reported rather than saved as working targets. An overspeed abort parks flow at zero with coils engaged. Other interrupted tests retain a saved restoration marker; startup or reconnect restores those settings without turning turbine power on.
+
+After calibration, choose 900 or 1800 RPM. Startup and reconnect still default to Manual. If interrupted during unloaded automatic spin-up, the saved loaded flow and engaged coils are restored before returning to Manual.
+
+Blade count, rotor mass, maximum flow and known variant/fluid readings identify the calibrated setup. Detectable changes invalidate the profile and require recalibration. Coil material/count are not exposed by the installed port, so **recalibrate after changing coils**. Persistent flow drift can recommend a profile check, but does not prove which block changed.
 
 Steam-reactor coordination and vent-setting controls are future work. RF modes still control only direct-power reactors. The RPM loop, API behavior and monitor routing are covered by simulations; real hardware testing is ongoing. Start with 900 RPM when trying it on a new setup and observe the response.
 
@@ -98,6 +110,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.20.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.0)** — Per-turbine calibration measures acceleration, braking and stable 900/1800 RPM flows. Saved profiles drive faster startup with automatic coils, loaded braking and fine correction. Adds profile invalidation, cancel/progress controls and durable recovery after interrupted tests.
 
 - **[v1.19.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.19.0)** — Opt-in 900/1800 RPM regulation for each turbine, gradual steam-flow adjustments, acceleration-aware control and clear steam/flow-limit status. Manual overrides and disconnects disarm RPM mode; boot remains Manual.
 

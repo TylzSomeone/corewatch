@@ -1,10 +1,10 @@
-Faster turbine calibration approach.
+Quicker loaded settling during turbine calibration.
 
-- Calibration now climbs toward both 900 and 1800 RPM with coils OFF, then engages them shortly before reaching the target.
-- Final settling and the 30-second stable-flow verification still use engaged coils, so saved flows describe actual power generation.
-- The measured 900 RPM flow seeds the 1800 RPM test instead of relying only on the initial short probe.
-- Cancel, original power/settings restoration, interrupted-test recovery, shortage detection and overspeed handling remain in place.
+- Coil engagement during the approach is limited to the final 1.5% of the test speed, rather than potentially switching around 800 RPM for the 900 RPM test.
+- Once engaged, calibration uses measured acceleration to adjust loaded steam flow. It no longer uses the normal operating loop's cautious 90-second lookahead for this test stage.
+- Loaded flow changes remain bounded to 5% of the hardware flow limit per sample. The final stable-flow verification still lasts 30 seconds with coils engaged.
+- Normal calibrated RPM operation, cancel/restoration, shortage detection, overspeed handling and restart recovery remain in place.
 
-Validated with 59 calibration checks plus per-sample acceleration assertions, 38 baseline RPM checks, fleet monitor interaction and Load Match regression checks. A slow-rotor simulation verifies unloaded acceleration at both target speeds and loaded steady measurements. Actual calibration duration depends on the turbine and steam supply; live hardware testing is ongoing.
+Validated with 65 calibration checks plus per-sample assertions, 38 baseline RPM checks, fleet monitor interaction and Load Match regression checks. The slow-rotor simulation that previously spent 196 seconds between engagement and 900 RPM verification now begins verification two seconds after engagement; actual hardware timing will vary. Both targets and imperfect acceleration estimates are covered.
 
-Cancel the current test, install through INFO > UPDATES, reboot from the CC terminal, then restart calibration with steam supplied and condensate draining. Existing profiles are retained; run START TEST if you want fresh measurements.
+Cancel the current test, install through INFO > UPDATES, reboot from the CC terminal, then restart calibration with steam supplied and condensate draining.

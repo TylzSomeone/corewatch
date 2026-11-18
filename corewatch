@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.20.2"
+local COREWATCH_VERSION = "1.20.3"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -2001,7 +2001,7 @@ do
             estimate=(response.drag*target+math.max(0,-(response.coastRate or 0)))/response.drive
         end
         run.loadedFlow=math.max(1,math.min(stats.maxFlow,math.floor(estimate+0.5)))
-        run.approaching=stats.rpm<target*0.9
+        run.approaching=stats.rpm<target*0.985
         run.approachAt,run.approachRPM=os.clock(),stats.rpm
         setCoils(device,stats,not run.approaching)
         setFlow(device,stats,run.approaching and math.max(run.probeFlow,run.loadedFlow*1.25) or run.loadedFlow)
@@ -2061,8 +2061,9 @@ do
                 local dt=at-run.approachAt
                 local rate=dt>0 and (stats.rpm-run.approachRPM)/dt or 0
                 run.approachAt,run.approachRPM=at,stats.rpm
-                local lead=run.response.engageSeconds or 6
-                local engageAt=math.max(run.target*0.85,run.target-math.max(10,run.target*0.02)-math.max(0,rate)*lead)
+                -- Coil load acts immediately: a long braking lead leaves a slow
+                -- rotor far below target. Limit this handoff to the final 1.5%.
+                local engageAt=run.target-math.max(5,math.min(run.target*0.015,math.max(0,rate)*2))
                 if stats.rpm>=engageAt then
                     run.approaching=false
                     setCoils(device,stats,true);setFlow(device,stats,run.loadedFlow)
@@ -2075,7 +2076,21 @@ do
                 return
             end
             local previous=record.rpmControl and record.rpmControl.lastRPM or stats.rpm
-            turbineUI.regulate(record,stats,device)
+            local state=record.rpmControl
+            local dt=state and at-state.lastAt or 0
+            local drive=run.response.drive
+            if state and dt>=1 and dt<=10 and drive and drive>0 then
+                local rate=(stats.rpm-state.lastRPM)/dt
+                state.lastAt,state.lastRPM=at,stats.rpm
+                state.rate=rate
+                -- Learn loaded flow from acceleration instead of spending minutes
+                -- creeping up with the normal operation loop's 90-second lookahead.
+                -- Aim to close the remaining gap over 20 seconds, then verify.
+                local wantedRate=math.max(-5,math.min(5,(run.target-stats.rpm)/20))
+                local adjustment=(wantedRate-rate)/drive*0.5
+                local step=math.max(1,stats.maxFlow*0.05)
+                setFlow(device,stats,stats.limit+math.max(-step,math.min(step,adjustment)))
+            else turbineUI.regulate(record,stats,device) end
             local stable=math.abs(stats.rpm-run.target)<=8 and math.abs(stats.rpm-previous)<=0.5
                 and stats.flow>0 and stats.limit>0
                 and stats.coils and math.abs(stats.flow-stats.limit)<=math.max(1,stats.limit*0.05)

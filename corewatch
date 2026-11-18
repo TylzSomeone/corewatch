@@ -1,5 +1,5 @@
 -- Corewatch | reactor control and telemetry for CC: Tweaked.
-local COREWATCH_VERSION = "1.20.4"
+local COREWATCH_VERSION = "1.21.0"
 
 local function runRFController(portName, screen, screenName, settingsPath, report, isVisible, reserveUpdate, installGate)
 local fill, clickEvent, adjustSelectedSetting, adjustRodsLevel, setRodInsertion, buildDashboard, readReactor, refreshDashboard, saveSettings, format_num
@@ -684,7 +684,7 @@ local function showInfo(page)
         line("Tap ALERTS for the reactor, reason, and an OPEN REACTOR button.")
         row = row + 1
         section("STEAM REACTORS & TURBINES")
-        line("Steam reactors have their own readings and manual controls.")
+        line("Steam reactors: PAIR turbines, then turn AUTO ON.")
         line("Teal steam trace: production in mB/t, sampled every 2s.")
         line("Tank gauges show steam and coolant amounts and percentages.")
         line("RF control modes do not regulate steam reactors.")
@@ -2232,6 +2232,156 @@ do
     end
 end
 
+-- Steam supply belongs to one reactor; a turbine can have only one source.
+-- Pairing is saved, but automatic control always needs a fresh button press.
+local steamUI = {}
+do
+    local function finite(value,label)
+        assert(type(value)=="number" and value==value and value>=0 and value<math.huge,"Invalid steam reading: "..label)
+        return value
+    end
+    function steamUI.read(device)
+        assert(not device.mbIsAssembled or device.mbIsAssembled(),"Steam reactor not assembled")
+        assert(device.isActivelyCooled(),"Cooling configuration changed")
+        local fuel,hot,cold=device.getFuelStats(),device.getHotFluidStats(),device.getCoolantFluidStats()
+        local rods=device.getControlRodsLevels()
+        local count,total=0,0
+        for _,level in pairs(rods) do finite(level,"rods");assert(level<=100,"Invalid rod level");count=count+1;total=total+level end
+        assert(count>0,"No control rods reported")
+        local stats={active=device.getActive(),rods=rods,rodLevel=total/count,
+            produced=finite(hot.fluidProducedLastTick,"production"),steam=finite(hot.fluidAmount,"steam"),
+            capacity=finite(hot.fluidCapacity,"steam capacity"),coolant=finite(cold.fluidAmount,"coolant"),
+            coolantCapacity=finite(cold.fluidCapacity,"coolant capacity"),fuel=finite(fuel.fuelAmount,"fuel"),fuelStats=fuel}
+        assert(type(stats.active)=="boolean" and stats.capacity>0 and stats.coolantCapacity>0,"Invalid steam reactor capacities or power")
+        return stats,hot,cold
+    end
+    local function rods(device,stats,level)
+        level=math.max(0,math.min(100,math.floor(level+0.5)))
+        local requested,changed={},false
+        for index,current in pairs(stats.rods) do
+            requested[index]=level
+            if level~=current then changed=true end
+        end
+        if changed then device.setControlRodsLevels(requested);stats.rods=requested;stats.rodLevel=level end
+    end
+    local function park(record,stats,device,message)
+        local state=record.steamControl
+        if not state.parked then state.resumeRod=stats.rodLevel end
+        rods(device,stats,100)
+        if stats.active then device.setActive(false);stats.active=false end
+        state.parked=true;state.fraction=0;state.previous=nil;state.lastAt=nil
+        record.steamState=message
+    end
+    function steamUI.manual(record,message)
+        record.steamAuto=false;record.steamControl=nil;record.steamWarning=nil
+        record.steamState=message or "Manual steam control"
+    end
+    function steamUI.demand(record)
+        local demand,count=0,0
+        for port,enabled in pairs(record.steamLinks or {}) do
+            if enabled then
+                count=count+1
+                local peer=record.steamPeer(port)
+                assert(peer and peer.machineType=="TURBINE","Paired turbine missing: "..port)
+                -- Fresh readings, including configured flow when steam-starved.
+                local ok,stats=pcall(turbineUI.read,peer)
+                if not ok then error("Cannot read "..(peer.name or port).."; check modem",0) end
+                if stats.active and stats.water<stats.tank-1 then demand=demand+stats.limit end
+            end
+        end
+        assert(count>0,"Pair at least one turbine")
+        return demand,count
+    end
+    function steamUI.tick(record,stats,device)
+        if not record.steamAuto then
+            local ok,demand,count=pcall(steamUI.demand,record)
+            record.steamDemand=ok and demand or nil;record.steamPeerCount=ok and count or nil
+            return
+        end
+        local state=record.steamControl or {};record.steamControl=state
+        local ok,demand,count=pcall(steamUI.demand,record)
+        if not ok then
+            park(record,stats,device,"Pairing/link lost; Auto OFF")
+            record.steamAuto=false;record.steamWarning=tostring(demand);record.steamDemand=nil
+            return
+        end
+        record.steamDemand,record.steamPeerCount=demand,count
+        record.steamWarning=nil
+        if state.expectedActive and not state.parked and not stats.active then
+            steamUI.manual(record,"Turbine supply paused: reactor OFF");return
+        end
+        local fill=stats.steam/stats.capacity
+        if demand<=0 then
+            -- A small idle reserve lets an OFF turbine begin calibration even
+            -- before it requests flow. Stop at 30%, refill only below 15%.
+            if fill<0.15 then state.idleFill=true end
+            if not state.idleFill or fill>=0.30 then
+                state.idleFill=nil;park(record,stats,device,"Turbines idle; reserve ready");return
+            end
+        else state.idleFill=nil end
+        if stats.fuel<=0 then park(record,stats,device,"Waiting for fuel");return end
+        if stats.coolant<=math.max(1,stats.coolantCapacity*0.01) then
+            state.coolantWait=true;park(record,stats,device,"Waiting for coolant");return
+        elseif state.coolantWait and stats.coolant<stats.coolantCapacity*0.1 then
+            park(record,stats,device,"Refilling coolant");return
+        end
+        state.coolantWait=nil
+        if fill>=0.9 or (state.fullWait and fill>0.65) then
+            state.fullWait=true;park(record,stats,device,"Steam reserve full");return
+        end
+        state.fullWait=nil
+        if not stats.active or state.parked then
+            rods(device,stats,math.min(95,state.resumeRod or stats.rodLevel))
+            if not stats.active then device.setActive(true);stats.active=true end
+            state.parked=false;state.expectedActive=true;state.previous=nil;state.lastAt=nil
+        end
+        state.expectedActive=true
+        -- Fill toward a modest 30% reserve over about 20 seconds. Hardware
+        -- shortage is handled by rods reaching zero, not by claiming extra output.
+        local target=math.max(state.idleFill and 20 or 0,demand+(stats.capacity*0.30-stats.steam)/400)
+        record.steamTarget=target
+        local at=os.clock();local dt=state.lastAt and at-state.lastAt or 0
+        if dt<1 or dt>10 then
+            state.previous,state.lastAt,state.fraction=stats.produced,at,0
+            record.steamState="Collecting steam trend";return
+        end
+        local trend=(stats.produced-state.previous)/dt
+        state.previous,state.lastAt=stats.produced,at
+        local slope=state.slope or math.max(1,stats.produced/math.max(1,100-stats.rodLevel))
+        state.slope=slope
+        if math.abs(trend)<math.max(1,stats.produced*0.002) and stats.rodLevel<95 then
+            state.slope=slope*0.9+stats.produced/math.max(1,100-stats.rodLevel)*0.1
+        end
+        local errorFlow=stats.produced+trend*20-target
+        local correction=math.max(-3,math.min(3,errorFlow/math.max(1,state.slope)*0.5))
+        if math.abs(errorFlow)<math.max(2,demand*0.015) and math.abs(fill-0.30)<0.05 then correction=0 end
+        state.fraction=(state.fraction or 0)+correction
+        local delta=state.fraction>=0 and math.floor(state.fraction) or math.ceil(state.fraction)
+        state.fraction=state.fraction-delta
+        local level=math.max(0,math.min(100,stats.rodLevel+delta))
+        rods(device,stats,level)
+        if level==0 or level==100 then state.fraction=0 end
+        record.steamState=state.idleFill and "Preparing steam reserve"
+            or level==0 and stats.produced<demand*0.95 and "At reactor steam limit"
+            or fill<0.20 and "Building steam reserve" or "Matching turbine demand"
+    end
+    function steamUI.toggleLink(record,port)
+        assert(not record.steamAuto,"Switch to Manual before changing pairs")
+        local links={};for name,enabled in pairs(record.steamLinks or {}) do links[name]=enabled end
+        if links[port] then links[port]=nil
+        else
+            local peer=record.steamPeer(port)
+            assert(peer and peer.machineType=="TURBINE","Turbine not found")
+            local owner=record.steamOwner(port)
+            assert(not owner or owner==record.port,"Already paired with "..tostring(owner))
+            links[port]=true
+        end
+        record.saveSteamLinks(links)
+        record.steamLinks=links;record.steamDemand=nil
+        record.steamState="Pairing saved"
+    end
+end
+
 -- Fleet supervisor: automatic machine discovery and independent monitor roles.
 local nativeTerminal = term.current()
 local REGISTRY_FILE = "corewatch-machines.txt"
@@ -2383,6 +2533,20 @@ local function scan()
                     saved.calibration,saved.calibrationRestore=profile,pending
                     local ok,reason=pcall(saveRegistry)
                     if not ok then saved.calibration,saved.calibrationRestore=oldProfile,oldPending;error(reason,0) end
+                end
+            end
+            if not turbine then
+                record.steamLinks=saved.steamLinks or {}
+                record.steamPeer=function(name) return byPort[name] end
+                record.steamOwner=function(name)
+                    for owner,entry in pairs(registry.machines) do
+                        if entry.steamLinks and entry.steamLinks[name] then return owner end
+                    end
+                end
+                record.saveSteamLinks=function(links)
+                    local previous=saved.steamLinks;saved.steamLinks=links
+                    local ok,reason=pcall(saveRegistry)
+                    if not ok then saved.steamLinks=previous;error(reason,0) end
                 end
             end
             record.phase = (#records * 0.07) % 2
@@ -2560,11 +2724,11 @@ local function runSteamController(record)
         local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
         assert(not device.mbIsAssembled or device.mbIsAssembled(), "Steam reactor not assembled")
         assert(device.isActivelyCooled(), "Cooling configuration changed")
-        local fuel = device.getFuelStats()
-        local steam = device.getHotFluidStats()
-        local coolant = device.getCoolantFluidStats()
-        local rods = device.getControlRodsLevels()
-        local active = device.getActive()
+        local stats,steam,coolant=steamUI.read(device)
+        if sample or record.steamRunNow then
+            record.steamRunNow=nil;steamUI.tick(record,stats,device)
+        end
+        local fuel,rods,active=stats.fuelStats,stats.rods,stats.active
         record.status = active and "RUNNING" or "OFF"
         record.output = steam.fluidProducedLastTick or 0
         record.unit = "mB/t"
@@ -2574,10 +2738,38 @@ local function runSteamController(record)
         frame(2, 2, divider, h - 1, "STEAM REACTOR")
         frame(divider + 1, 2, w - 1, controlsBottom, active and "RUNNING" or "OFF", active and colors.cyan or colors.red)
         frame(divider + 1, controlsBottom + 2, w - 1, h - 1, "FUEL & HEAT")
+        if record.steamPairPage then
+            screen.clear()
+            buttons={}
+            textAt(screen,3,2,"PAIR TURBINES | "..record.name,colors.cyan)
+            textAt(screen,3,4,"One reactor per turbine. Fluid pipes must match your pairing.",colors.lightGray)
+            local peers={}
+            for _,peer in ipairs(records) do if peer.machineType=="TURBINE" then peers[#peers+1]=peer end end
+            local perPage=math.max(1,math.floor((h-12)/3))
+            local pages=math.max(1,math.ceil(#peers/perPage))
+            record.steamPairIndex=math.max(1,math.min(pages,record.steamPairIndex or 1))
+            if #peers==0 then textAt(screen,3,7,"No turbines detected. Connect enabled wired modems.",colors.orange) end
+            for i=(record.steamPairIndex-1)*perPage+1,math.min(#peers,record.steamPairIndex*perPage) do
+                local peer=peers[i];local row=6+((i-1)%perPage)*3
+                local paired=record.steamLinks[peer.port]
+                local owner=record.steamOwner(peer.port)
+                button("LINK",(paired and "[PAIRED] " or "[PAIR] ")..peer.name,3,row,w-3,row+1,
+                    paired and colors.green or owner and colors.gray or colors.blue,false,peer.port)
+            end
+            button("PAIR-PREV","<",3,h-4,10,h-3,colors.blue)
+            button("PAIR-BACK","BACK",12,h-4,24,h-3,colors.blue)
+            button("PAIR-NEXT",">",w-10,h-4,w-3,h-3,colors.blue)
+            textAt(screen,28,h-3,"Page "..record.steamPairIndex.."/"..pages,colors.lightGray)
+            textAt(screen,3,h,record.steamWarning or record.steamState or "Switch to Manual before changing pairs",colors.orange)
+            return
+        end
         graph(record.output, sample)
+        local demand=record.steamDemand
+        textAt(screen,lx,3,("NEED "..(demand and number(demand) or "--").." | PRODUCED "..number(record.output).." mB/t"):sub(1,span),colors.cyan)
+        textAt(screen,lx,h-6,(record.steamWarning or record.steamState or "Pair turbines to enable automatic supply"):sub(1,span),record.steamWarning and colors.orange or colors.lightGray)
         gauge("STEAM", steam.fluidAmount, steam.fluidCapacity, graphBottom + 2, colors.lime)
         gauge("COOLANT", coolant.fluidAmount, coolant.fluidCapacity, graphBottom + 7, colors.lightBlue)
-        local rodLevel = rods[0] or 0
+        local rodLevel = stats.rodLevel
         textAt(screen, lx, h - 4, "ROD INSERTION " .. number(rodLevel) .. "%")
         rect(lx, h - 3, lx + span - 1, h - 3, colors.gray)
         local filled = math.floor(span * math.max(0, math.min(100, rodLevel)) / 100)
@@ -2586,10 +2778,10 @@ local function runSteamController(record)
         local middle = math.floor((rx + right) / 2)
         button("ON", "ON", rx, 4, middle - 1, 6, colors.blue, active)
         button("OFF", "OFF", middle + 1, 4, right, 6, colors.blue, not active)
-        textAt(screen, rx, 8, "MANUAL STEAM CONTROL", colors.cyan)
-        textAt(screen, rx, 9, "Auto regulation: later", colors.lightGray)
-        textAt(screen, rx, 11, "ROD INSERTION", colors.lightGray)
-        textAt(screen, rx, 12, number(rodLevel) .. "%")
+        button("AUTO",record.steamAuto and "AUTO ON" or "AUTO OFF",rx,8,middle-1,9,colors.blue,record.steamAuto)
+        button("PAIR","PAIR",middle+1,8,right,9,colors.purple)
+        textAt(screen, rx, 11, record.steamAuto and "AUTOMATIC STEAM" or "MANUAL STEAM", colors.cyan)
+        textAt(screen, rx, 12, "RODS "..number(rodLevel).."%")
         button("RODS", "-10%", rx, 14, middle - 1, 16, colors.lightBlue, false, -10)
         button("RODS", "-1%", middle + 1, 14, right, 16, colors.purple, false, -1)
         button("RODS", "+10%", rx, 18, middle - 1, 20, colors.lightBlue, false, 10)
@@ -2619,9 +2811,24 @@ local function runSteamController(record)
             local device = assert(peripheral.wrap(portName), "Steam reactor link lost")
             assert(device.isActivelyCooled(), "Cooling configuration changed")
             assert(not device.mbIsAssembled or device.mbIsAssembled(), "Steam reactor not assembled")
-            if clicked.id == "ON" then device.setActive(true)
-            elseif clicked.id == "OFF" then device.setActive(false)
+            if clicked.id=="PAIR" then record.steamPairPage=true
+            elseif clicked.id=="PAIR-BACK" then record.steamPairPage=false
+            elseif clicked.id=="PAIR-PREV" then record.steamPairIndex=(record.steamPairIndex or 1)-1
+            elseif clicked.id=="PAIR-NEXT" then record.steamPairIndex=(record.steamPairIndex or 1)+1
+            elseif clicked.id=="LINK" then
+                local ok,reason=pcall(steamUI.toggleLink,record,clicked.change)
+                record.steamWarning=not ok and tostring(reason) or nil
+            elseif clicked.id=="AUTO" then
+                if record.steamAuto then steamUI.manual(record)
+                else
+                    local ok,reason=pcall(steamUI.demand,record)
+                    if ok then record.steamAuto=true;record.steamControl={};record.steamRunNow=true
+                    else record.steamWarning=tostring(reason) end
+                end
+            elseif clicked.id == "ON" then steamUI.manual(record);device.setActive(true)
+            elseif clicked.id == "OFF" then steamUI.manual(record);device.setActive(false)
             else
+                steamUI.manual(record)
                 local delta = clicked.change
                 if delta then
                     -- Read current positions at the instant of the touch.
@@ -2701,7 +2908,8 @@ local function resumeWorker(record, event)
     record.terminal = term.current()
     term.redirect(nativeTerminal)
     if not ok or coroutine.status(record.thread) == "dead" then
-        if record.machineType=="TURBINE" then turbineUI.reset(record) end
+        if record.machineType=="TURBINE" then turbineUI.reset(record)
+        elseif record.kind=="STEAM" then steamUI.manual(record,"Steam link interrupted; Manual") end
         record.thread = nil
         record.status = "CONTROLLER PAUSED"
         record.error = tostring(filter or "Controller stopped")
@@ -2742,6 +2950,10 @@ local function alerts()
             issue = "PORT READ FAILED"
             detail = "Corewatch could not read this reactor's cooling configuration."
             hint = "Check the reactor assembly and computer port."
+        elseif record.kind=="STEAM" and record.steamWarning then
+            issue="STEAM SUPPLY PAUSED"
+            detail=record.steamWarning
+            hint="Check turbine pairing and connections, then enable AUTO SUPPLY."
         elseif record.fuel and record.fuel < 5 then
             issue = record.fuel <= 0 and "NO FUEL" or string.format("LOW FUEL (%.1f%%)", record.fuel)
             detail = record.fuel <= 0 and "The reactor's fuel supply is empty." or "Fuel is below the 5% alert threshold."

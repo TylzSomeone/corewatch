@@ -12,7 +12,7 @@ Corewatch is a touchscreen dashboard and controller for Extreme Reactors in Mine
 - Saves your buffer limits, RF/t target, boot mode, and sound preference.
 - Reconnects when each reactor port returns without stopping other controllers, and can check GitHub for updates.
 - Lists connected reactors under **MACHINES**, with separate settings, names, histories, and RF session statistics.
-- Detects steam reactors and provides steam/coolant readings plus manual power and rod controls.
+- Detects steam reactors, shows steam/coolant readings, and provides manual controls or automatic supply for paired turbines.
 - Automatically discovers turbines and shows RPM, output, stored energy, steam/water, blade efficiency and flow.
 - Provides manual turbine controls, per-turbine calibration and opt-in 900/1800 RPM regulation with automatic coil handling.
 - Assigns one spare monitor to turbines automatically; choose or disable it under **MACHINES → MONITORS**.
@@ -33,7 +33,7 @@ Tap **MODE → BOOT MODE** to choose what opens after a reboot. New reactors def
 
 ## Setup
 
-- **Reactors:** One or more Extreme Reactors reactors with **Reinforced Reactor Computer Ports**. Direct RF reactors retain all five control modes. Steam reactors currently have readings and manual controls; automatic steam regulation and reactor-to-turbine coordination are future work.
+- **Reactors:** One or more Extreme Reactors reactors with **Reinforced Reactor Computer Ports**. Direct RF reactors retain all five control modes. Steam reactors support manual controls and opt-in automatic supply for paired turbines.
 - **Turbines:** Reinforced Turbine Computer Ports shared through enabled wired modems. Turbines are discovered automatically; no peripheral names to enter or files to edit.
 - **Computer:** A CC: Tweaked computer connected directly to the reactor port or through a wired modem network. Enable peripheral access on the wired modem attached to the port.
 - **Display:** **4 blocks wide by 3 blocks tall** is recommended for the main console. A dedicated turbine screen supports **2×2 or larger** at scale 0.5. The spare monitor is optional; turbine pages also open on the main console.
@@ -58,13 +58,27 @@ shell.run("corewatch")
 
 ## Multiple reactors
 
-Tap **MACHINES** in the persistent top bar to select a reactor. All controllers continue working while you browse another dashboard or the paginated machine list. Tap **ALERTS** in the top bar or machine overview to see affected reactor names, ports, specific problems, and suggested checks. Use **OPEN REACTOR** to jump to that machine; **BACK** returns to the previous view. The list updates as faults clear and supports multiple pages. The count represents affected reactors. Current conditions include fuel below 5% (with a distinct empty-fuel message), lost links, incomplete assemblies, paused controllers, and unreadable ports. New ports are discovered automatically; saved missing ports remain listed for diagnosis.
+Tap **MACHINES** in the persistent top bar to select a reactor. All controllers continue working while you browse another dashboard or the paginated machine list. Tap **ALERTS** in the top bar or machine overview to see affected reactor names, ports, specific problems, and suggested checks. Use **OPEN REACTOR** to jump to that machine; **BACK** returns to the previous view. The list updates as faults clear and supports multiple pages. The count represents affected reactors. Current conditions include paused automatic steam supply, fuel below 5% (with a distinct empty-fuel message), lost links, incomplete assemblies, paused controllers, and unreadable ports. New ports are discovered automatically; saved missing ports remain listed for diagnosis.
 
 When upgrading an existing installation with several reactors connected, first select the **original reactor** to inherit your old settings. Controllers wait for that choice. Other RF reactors begin in **Manual** and retain their existing power state and rod positions until you change them. Configure each reactor's boot mode separately.
 
 Use **RENAME** on a reactor page, type a name at the CC computer, and press Enter. Escape cancels. Assignments are tied to exact peripheral names; check them after replacing or moving computer ports.
 
-Steam reactors show a thin teal production-history trace in mB/t, percentage gauges for steam and coolant, a rod insertion bar, fuel, waste, temperatures, and full touch buttons for power and ±10%/±1% rod adjustments. The graph adds a sample every two seconds; button presses do not add samples. Empty tanks are labeled EMPTY. Corewatch does not yet coordinate turbines or automatically regulate steam. The main console can show any machine, and a spare monitor can separately show turbines.
+Steam reactors show a thin teal production-history trace in mB/t, percentage gauges for steam and coolant, a rod insertion bar, fuel, waste, temperatures, and full touch buttons for power and ±10%/±1% rod adjustments. The graph adds a sample every two seconds; button presses do not add samples. Empty tanks are labeled EMPTY. Pair turbines and enable Auto Supply to regulate steam production for their combined flow demand. The main console can show any machine, and a spare monitor can separately show turbines.
+
+## Automatic steam supply
+
+Open your steam reactor under **MACHINES**, tap **PAIR**, and tap each turbine physically supplied by that reactor. A reactor may feed several turbines; a turbine can be paired with only one reactor. Pairing choices are saved in `corewatch-machines.txt`. The list supports multiple pages. Pairing tells Corewatch which demand belongs to the reactor; it does not create fluid connections or route steam. Connect steam pipes and a coolant/condensate return yourself.
+
+Tap **BACK**, then **AUTO OFF** to switch it to **AUTO ON**. This explicitly allows the reactor to start, stop and adjust all its rods together. The dashboard shows combined **NEED** and **PRODUCED** in mB/t, plus its current supply status. Existing turbine profiles and speed controls are unchanged.
+
+Auto Supply uses each active paired turbine's configured flow, including during unloaded acceleration or calibration, so a steam-starved turbine still contributes its requested demand. A stopped turbine or one with a full water outlet contributes no demand. Production is adjusted toward demand plus a modest reserve around 30% of the reactor's internal steam tank. Rod changes are bounded to three percentage points per two-second sample, using production trend to avoid chasing thermal lag.
+
+When turbines are idle, the reactor stops with rods fully inserted once reserve is ready; it refills from below 15% toward 30% so there is steam for the next startup. Allow the initial reserve to build before starting turbine calibration. A steam tank at 90% pauses generation until it falls to 65%. Missing fuel or nearly empty coolant also pauses generation; coolant must recover above 10% before restarting. These pauses resume automatically while Auto Supply remains enabled. If production cannot meet demand at zero rod insertion, the screen reports the reactor steam limit. Full reactor steam with starving turbines can indicate a pipe throughput or connection problem.
+
+Tap **AUTO ON** to return to Manual. The reactor's ON/OFF or rod buttons also leave Auto Supply before applying your manual command. Switch to Manual before editing pairs. An external reactor OFF disables automatic supply rather than restarting it.
+
+A missing or unreadable paired turbine makes its reactor stop, fully insert rods and disable Auto Supply. Reconnect it and select Auto again. A lost reactor link also disarms its automatic supply. Other reactors keep their independent controls. **Reboot always starts steam reactors in Manual**, preserving physical power/rod settings and saved pairings; enable Auto again when ready. This does not change the existing RF boot modes.
 
 ## Turbines and monitor discovery
 
@@ -76,13 +90,13 @@ Tap **TURBINES** on the dedicated screen to switch turbines. Its dashboard shows
 
 Use separate ON/OFF and COILS ON/OFF controls. OFF does not instantly brake the rotor. Flow steps adjust by 10 or 100 mB/t. Tap FLOW, type a whole number at the CC computer, and press Enter; Escape cancels. The port's hardware maximum is enforced and the exact target is checked again before each write.
 
-Turbines retain their active state, coil state and flow settings at startup and reconnect. Each turbine starts in **Manual**. Select **900 RPM** or **1800 RPM** to regulate speed by gradually adjusting steam intake. Selecting a target does not start the turbine or engage its coils: RPM mode waits until those are enabled explicitly.
+Turbines retain their active state, coil state and flow settings at startup and reconnect. Each turbine starts in **Manual**. Select **900 RPM** or **1800 RPM** to regulate speed by gradually adjusting steam intake. Selecting a target turns the turbine on when needed and starts calibration if there is no valid saved profile.
 
 Choosing 900 or 1800 RPM without a valid saved profile starts calibration, then continues at the selected speed after a successful test. With calibration, it uses measured flow, acceleration and braking response, disengages coils during initial acceleration, and re-engages them within the final 1.5% of the target, using the same engagement rule as calibration. Deceleration keeps coils engaged and cuts steam, then returns to the measured flow near the target. Fine flow corrections are limited to about 1% of the hardware maximum, capped at 25 mB/t per sample. Calibrated startup can select a measured flow directly and use a temporary steam boost; braking can cut flow to zero. It reports insufficient steam, full condensate storage or the hardware flow limit instead of continually increasing demand. Manual flow changes, OFF and COILS OFF cancel RPM mode. MANUAL retains the current flow setting. A failed turbine link disarms RPM mode; opt in again after reconnecting.
 
 ### Calibrating a turbine
 
-Supply steam continuously and make sure condensate can leave. Open **CALIBRATE / PROFILE** and select **START TEST**. Calibration changes flow and coil engagement; unloading coils temporarily stops power generation. START TEST turns the turbine on if needed. It never starts or adjusts a reactor.
+Supply steam continuously and make sure condensate can leave. Open **CALIBRATE / PROFILE** and select **START TEST**. Calibration changes flow and coil engagement; unloading coils temporarily stops power generation. START TEST turns the turbine on if needed. The test controls the turbine; a paired reactor in Auto Supply independently follows its changing steam demand.
 
 The staged test measures unloaded coast, acceleration and coil braking, then climbs toward each test speed with coils disengaged. Coils engage within the final 1.5% of the target. Calibration uses measured acceleration to correct loaded flow while settling, then verifies stable loaded flow at 900 and 1800 RPM. The measured 900 RPM flow helps estimate the 1800 RPM starting flow. Progress and elapsed time appear on the profile page; BACK lets you watch the normal dashboard while the test continues. **CANCEL TEST** restores the previous flow, coils and original OFF state if the test started the turbine. Failure restores those settings too, except overspeed parks steam at zero with coils engaged. A standalone START TEST restores settings and returns to Manual when complete; a test started by choosing an RPM continues at that speed after successful calibration. Slow rotors can take several minutes to settle.
 
@@ -92,7 +106,7 @@ Choosing a calibrated RPM also turns the turbine on if needed. Startup and recon
 
 Blade count, rotor mass, maximum flow and known variant/fluid readings identify the calibrated setup. Detectable changes invalidate the profile and require recalibration. Coil material/count are not exposed by the installed port, so **recalibrate after changing coils**. Persistent flow drift can recommend a profile check, but does not prove which block changed.
 
-Steam-reactor coordination and vent-setting controls are future work. RF modes still control only direct-power reactors. The RPM loop, API behavior and monitor routing are covered by simulations; real hardware testing is ongoing. Start with 900 RPM when trying it on a new setup and observe the response.
+Automatic steam supply is available through the steam-reactor page; vent-setting controls are future work. RF modes still control only direct-power reactors. The RPM loop, API behavior and monitor routing are covered by simulations; real hardware testing is ongoing. Start with 900 RPM when trying it on a new setup and observe the response.
 
 There is no fixed reactor-count limit in the code. Automated simulations covered 40 reactors and two independently controlled turbines, but real-world capacity depends on the computer, modpack, and wired network. Each controller has a staggered refresh cycle and physical monitor writes are limited to changed rows.
 
@@ -110,6 +124,8 @@ Tap **INSTALL** when you're ready. Then **open the CC computer's terminal and ho
 - **Standby waits after a reboot or a lost link:** Tap **ARM** to allow automatic starts again.
 
 ## Update log
+
+- **[v1.21.0](https://github.com/TylzSomeone/corewatch/releases/tag/v1.21.0)** — Saved touchscreen reactor-to-turbine pairing and opt-in automatic steam supply. Matches combined configured flow, maintains a small reserve, pauses for idle turbines/full steam/missing coolant or fuel, and disarms on lost pairs. Shows needed versus produced steam on the 4×3 reactor page.
 
 - **[v1.20.4](https://github.com/TylzSomeone/corewatch/releases/tag/v1.20.4)** — Normal saved-profile startup now shares calibration’s close-to-target coil engagement. Already-spinning rotors also accelerate unloaded when below the final approach band. Existing profiles remain usable without recalibration.
 
